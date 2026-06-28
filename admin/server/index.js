@@ -502,7 +502,19 @@ app.put(
       process.env.ANCHOR_PROVIDER = p;
     }
 
-    if (Object.keys(updates).length) await upsertEnv(updates);
+    if (Object.keys(updates).length) {
+      // Durable store: keep settings in the database so they survive restarts
+      // and redeploys (the .env file lives on ephemeral container storage).
+      const db = await readDb();
+      db.settings = { ...(db.settings || {}), ...updates };
+      await writeDb(db);
+      // Best-effort local convenience copy; ephemeral in production.
+      try {
+        await upsertEnv(updates);
+      } catch {
+        // ignore — the database copy above is the source of truth
+      }
+    }
     res.json({ ok: true, ...settingsPayload() });
   })
 );
@@ -2565,6 +2577,26 @@ app.get("*", (req, res, next) => {
     if (err) next();
   });
 });
+
+// Hydrate runtime config from the database so user-saved settings (fal key,
+// gemini key, anchor provider) persist across restarts and redeploys. These
+// take precedence over the injected environment defaults once a user saves them.
+async function applyStoredSettings() {
+  try {
+    const db = await readDb();
+    const s = db.settings || {};
+    if (s.FAL_KEY) setFalKey(s.FAL_KEY);
+    if (s.GEMINI_API_KEY) process.env.GEMINI_API_KEY = s.GEMINI_API_KEY;
+    if (s.ANCHOR_PROVIDER) process.env.ANCHOR_PROVIDER = s.ANCHOR_PROVIDER;
+    if (Object.keys(s).length) {
+      console.log(`  Loaded saved settings: ${Object.keys(s).join(", ")}`);
+    }
+  } catch (err) {
+    console.error("[settings] failed to load stored settings:", err.message);
+  }
+}
+
+await applyStoredSettings();
 
 app.listen(PORT, () => {
   console.log(`\n  Hazawy admin server  ->  http://localhost:${PORT}`);
