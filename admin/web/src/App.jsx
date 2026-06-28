@@ -1254,6 +1254,8 @@ function SettingsPage({ onError, onSaved }) {
   const [model, setModel] = useState("nano_banana");
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
+  const [testing, setTesting] = useState(false);
+  const [testResult, setTestResult] = useState(null); // { ok: boolean, msg: string }
 
   function load() {
     api
@@ -1288,6 +1290,22 @@ function SettingsPage({ onError, onSaved }) {
       onError?.(e.message);
     } finally {
       setSaving(false);
+    }
+  }
+
+  async function testKey() {
+    setTesting(true);
+    setTestResult(null);
+    try {
+      await api.testFalKey(falKey.trim() || undefined);
+      setTestResult({
+        ok: true,
+        msg: falKey.trim() ? "This key works ✓" : "Saved key works ✓",
+      });
+    } catch (e) {
+      setTestResult({ ok: false, msg: e.message });
+    } finally {
+      setTesting(false);
     }
   }
 
@@ -1352,6 +1370,25 @@ function SettingsPage({ onError, onSaved }) {
             onToggle={() => setShowFal((v) => !v)}
             placeholder={settings?.falKey?.set ? "Enter a new key to replace" : "Paste your FAL_KEY"}
           />
+          <div className="mt-3 flex items-center gap-3">
+            <button
+              onClick={testKey}
+              disabled={testing || (!falKey.trim() && !settings?.falKey?.set)}
+              className="inline-flex items-center gap-2 rounded-lg border border-[var(--color-border)] bg-[var(--color-panel-2)] px-3 py-1.5 text-sm font-medium text-zinc-200 transition-colors hover:bg-[var(--color-panel)] disabled:cursor-not-allowed disabled:opacity-60"
+            >
+              {testing && <Spinner />}
+              {falKey.trim() ? "Test this key" : "Test key"}
+            </button>
+            {testResult && (
+              <span
+                className={`text-sm ${
+                  testResult.ok ? "text-[var(--color-accent-2)]" : "text-rose-400"
+                }`}
+              >
+                {testResult.msg}
+              </span>
+            )}
+          </div>
         </Section>
 
         <Section title="Model">

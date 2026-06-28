@@ -29,6 +29,7 @@ import {
   padToSquareFal,
   downloadToUploads,
   setFalKey,
+  testFalKey,
 } from "./fal.js";
 import {
   checkConsistency,
@@ -335,6 +336,14 @@ async function resolveUser(req) {
     ? ALL_PAGES.slice()
     : (record?.pages || []).filter((p) => ASSIGNABLE_PAGES.includes(p));
 
+  // #region agent log
+  try {
+    const _p = { sessionId: '1a21d9', runId: 'pre-fix', hypothesisId: 'A,B,C', location: 'server/index.js:resolveUser', message: 'resolved user', data: { userId, resolvedEmail: email, recordExists: Boolean(record), recordRole: record?.role || null, recordEmailKey: record?.email || null, knownUserEmails: Object.keys(users), forcedAdmin, isAdmin, pages }, timestamp: Date.now() };
+    console.log('[agent-log]', JSON.stringify(_p));
+    fetch('http://127.0.0.1:7678/ingest/f54dfce7-ecd1-4bb5-989f-445348e0d26e', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Debug-Session-Id': '1a21d9' }, body: JSON.stringify(_p) }).catch(() => {});
+  } catch {}
+  // #endregion
+
   return { email, userId, role: isAdmin ? "admin" : "member", isAdmin, pages, exists: Boolean(record) };
 }
 
@@ -519,6 +528,24 @@ app.put(
   })
 );
 
+// Verify the fal.ai key works. Tests a pasted key when provided, otherwise the
+// currently configured one. Admin-only via the /api/settings route gate.
+app.post(
+  "/api/settings/test-fal",
+  asyncHandler(async (req, res) => {
+    const override =
+      typeof req.body?.falKey === "string" && req.body.falKey.trim()
+        ? req.body.falKey.trim()
+        : undefined;
+    try {
+      await testFalKey(override);
+      res.json({ ok: true });
+    } catch (err) {
+      res.status(400).json({ ok: false, error: err?.message || "The fal.ai key check failed." });
+    }
+  })
+);
+
 // --- Access / team ------------------------------------------------------------
 const PAGE_META = {
   authEnabled: AUTH_ENABLED,
@@ -547,7 +574,26 @@ app.get(
       });
     }
     const me = req.me;
-    res.json({ ...PAGE_META, email: me.email, role: me.role, isAdmin: me.isAdmin, pages: me.pages });
+    // #region agent log
+    let _debug;
+    try {
+      const db = await readDb();
+      const users = db.access?.users || {};
+      _debug = {
+        resolvedEmail: me.email,
+        isAdmin: me.isAdmin,
+        role: me.role,
+        pages: me.pages,
+        recordExistsForResolvedEmail: Boolean(users[me.email]),
+        knownUserEmails: Object.keys(users),
+        adminEmailsConfigured: ADMIN_EMAILS,
+      };
+      const _p = { sessionId: '1a21d9', runId: 'pre-fix', hypothesisId: 'A,B,C,D', location: 'server/index.js:/api/access/me', message: 'access/me response', data: _debug, timestamp: Date.now() };
+      console.log('[agent-log]', JSON.stringify(_p));
+      fetch('http://127.0.0.1:7678/ingest/f54dfce7-ecd1-4bb5-989f-445348e0d26e', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Debug-Session-Id': '1a21d9' }, body: JSON.stringify(_p) }).catch(() => {});
+    } catch {}
+    // #endregion
+    res.json({ ...PAGE_META, email: me.email, role: me.role, isAdmin: me.isAdmin, pages: me.pages, _debug });
   })
 );
 

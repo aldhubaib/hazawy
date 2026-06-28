@@ -43,6 +43,28 @@ export function setFalKey(key) {
   configured = true;
 }
 
+/**
+ * Verify a fal.ai key actually authenticates, without running a (paid) model.
+ * Does a tiny storage upload — fal rejects bad credentials with 401/403. Pass an
+ * `overrideKey` to test a pasted key before saving it; the previously active key
+ * is restored afterward so a test never changes the live configuration.
+ */
+export async function testFalKey(overrideKey) {
+  const prev = (process.env.FAL_KEY || "").trim();
+  const cred = (overrideKey || prev).trim();
+  if (!cred) throw new Error("No fal.ai key to test — paste a key or save one first.");
+  try {
+    fal.config({ credentials: cred });
+    const file = new File([new Uint8Array([1])], "fal-key-check.bin", {
+      type: "application/octet-stream",
+    });
+    await fal.storage.upload(file);
+    return true;
+  } finally {
+    if (prev) fal.config({ credentials: prev });
+  }
+}
+
 /** Upload a local file to fal storage and return a public URL. */
 export async function uploadToFal(absPath) {
   ensureConfigured();

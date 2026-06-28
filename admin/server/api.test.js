@@ -158,6 +158,20 @@ test("PUT /api/settings rejects an unknown model", async () => {
   assert.equal(res.status, 400);
 });
 
+test("POST /api/settings/test-fal reports clearly when no key is set", async () => {
+  // FAL_KEY is forced empty for the test, so the check should fail cleanly
+  // (400 + ok:false) rather than throw or hit the network.
+  const res = await api("/api/settings/test-fal", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({}),
+  });
+  assert.equal(res.status, 400);
+  const body = await res.json();
+  assert.equal(body.ok, false);
+  assert.match(body.error, /key/i);
+});
+
 test("access user lifecycle: create, list, reject bad email", async () => {
   const email = "teammate@example.com";
 

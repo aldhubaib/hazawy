@@ -55,6 +55,12 @@ export const api = {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(patch),
     }).then(json),
+  testFalKey: (falKey) =>
+    authFetch("/api/settings/test-fal", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(falKey ? { falKey } : {}),
+    }).then(json),
   // --- Test-image library -----------------------------------------------------
   getTestImages: () => authFetch("/api/test-images").then(json),
   uploadTestImage: (gender, file) => {
