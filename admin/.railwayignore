@@ -1,0 +1,12 @@
+node_modules
+web/node_modules
+web/dist
+server/uploads
+server/data
+server/.env
+web/.env
+web/.env.local
+.DS_Store
+*.log
+swaptest.mjs
+swaptest2.mjs

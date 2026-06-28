@@ -1,0 +1,9 @@
+node_modules
+web/node_modules
+server/.env
+web/.env
+web/.env.local
+server/data/stories.json
+server/uploads/
+dist
+.DS_Store

@@ -1,0 +1,31 @@
+{
+  "name": "hazawy-admin",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Local admin tool to test kid-photo character consistency via fal.ai",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "setup": "npm install && npm --prefix web install",
+    "dev": "concurrently -n server,web -c blue,magenta \"npm:dev:server\" \"npm:dev:web\"",
+    "dev:server": "node --watch server/index.js",
+    "dev:web": "npm --prefix web run dev",
+    "build": "npm --prefix web install && npm --prefix web run build",
+    "start": "node server/index.js"
+  },
+  "dependencies": {
+    "@clerk/express": "^2.1.32",
+    "@fal-ai/client": "^1.6.2",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
+    "multer": "^2.2.0",
+    "nanoid": "^5.0.9",
+    "sharp": "^0.35.1"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.2"
+  }
+}
