@@ -1,5 +1,16 @@
 const nativeFetch = window.fetch.bind(window);
 
+// A stable id for this browser tab. Sent on every request and echoed back on the
+// live-update stream so a client can ignore the change pings it caused itself.
+export const clientId =
+  (window.crypto?.randomUUID?.() ||
+    `c-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`);
+
+// URL of the Server-Sent Events stream used for live collaboration.
+export function eventsUrl() {
+  return `/api/events?clientId=${encodeURIComponent(clientId)}`;
+}
+
 // App registers a Clerk token getter here so every request carries the user's
 // session as a Bearer token (the backend verifies it for access control).
 let tokenGetter = null;
@@ -9,6 +20,7 @@ export function setAuthTokenGetter(fn) {
 
 async function authFetch(input, init = {}) {
   const headers = new Headers(init.headers || {});
+  headers.set("X-Client-Id", clientId);
   if (tokenGetter) {
     try {
       const token = await tokenGetter();

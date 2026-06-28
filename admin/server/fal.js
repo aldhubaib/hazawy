@@ -5,7 +5,11 @@ import { fal } from "@fal-ai/client";
 import sharp from "sharp";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const UPLOAD_DIR = path.join(__dirname, "uploads");
+// Must match index.js: downloaded images have to land in the SAME directory the
+// server serves `/uploads` from. In production DATA_ROOT points at a mounted
+// volume; writing to __dirname/uploads here would save files the app can't serve.
+const DATA_ROOT = process.env.DATA_ROOT || __dirname;
+const UPLOAD_DIR = path.join(DATA_ROOT, "uploads");
 
 const MIME_BY_EXT = {
   ".png": "image/png",
