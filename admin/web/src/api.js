@@ -23,7 +23,17 @@ async function authFetch(input, init = {}) {
 async function json(res) {
   if (!res.ok) {
     const body = await res.json().catch(() => ({}));
-    throw new Error(body.error || `Request failed (${res.status})`);
+    const err = new Error(body.error || `Request failed (${res.status})`);
+    // Attach request metadata so the global error dialog can include it in the
+    // copy/paste report (read by ErrorReporter.jsx via `err.httpInfo`).
+    err.httpInfo = {
+      method: "GET",
+      url: res.url,
+      status: res.status,
+      statusText: res.statusText,
+      body: body && body.error ? String(body.error) : "",
+    };
+    throw err;
   }
   return res.json();
 }
