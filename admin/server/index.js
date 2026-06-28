@@ -393,6 +393,11 @@ async function resolveUser(req) {
 app.use(async (req, res, next) => {
   if (!AUTH_ENABLED) return next();
   if (!req.path.startsWith("/api/")) return next();
+  // The live-update stream carries only low-sensitivity change pings (which
+  // story/order changed, and by whom) and EventSource can't send a Bearer
+  // token, so it bypasses the module gate. The actual data is still fetched
+  // through auth-gated endpoints.
+  if (req.path === "/api/events") return next();
 
   try {
     const me = await resolveUser(req);
@@ -416,6 +421,79 @@ app.use(async (req, res, next) => {
 });
 
 app.use("/uploads", express.static(UPLOAD_DIR));
+
+// ---------------------------------------------------------------------------
+// Live updates (Server-Sent Events)
+// ---------------------------------------------------------------------------
+// A tiny in-memory pub/sub so two people editing the same story see each
+// other's changes. Clients open an EventSource on /api/events; every time a
+// story/order mutating request succeeds we broadcast a small "changed" ping and
+// each client re-fetches the affected item. This keeps the data flow simple
+// (no shared-document CRDT) while giving near-instant live sync for a small team.
+const sseClients = new Set();
+
+function broadcastEvent(event) {
+  const frame = `data: ${JSON.stringify(event)}\n\n`;
+  for (const client of sseClients) {
+    try {
+      client.write(frame);
+    } catch {
+      // A dead socket is cleaned up by its own 'close' handler.
+    }
+  }
+}
+
+app.get("/api/events", (req, res) => {
+  res.writeHead(200, {
+    "Content-Type": "text/event-stream",
+    "Cache-Control": "no-cache, no-transform",
+    Connection: "keep-alive",
+    // Disable proxy buffering (nginx / Railway edge) so events flush immediately.
+    "X-Accel-Buffering": "no",
+  });
+  res.write("retry: 3000\n\n");
+  res.write(`data: ${JSON.stringify({ type: "connected", at: Date.now() })}\n\n`);
+
+  sseClients.add(res);
+
+  // Heartbeat keeps idle proxies from dropping the long-lived connection.
+  const heartbeat = setInterval(() => {
+    try {
+      res.write(": ping\n\n");
+    } catch {
+      /* ignore */
+    }
+  }, 25000);
+
+  req.on("close", () => {
+    clearInterval(heartbeat);
+    sseClients.delete(res);
+  });
+});
+
+// Broadcast a change ping whenever a story/order mutating request succeeds.
+// Hooks the response 'finish' event so it covers every existing handler (cells,
+// kid photos, generate, title, order edits, …) without touching each one. The
+// originating client id is echoed so a client can ignore its own writes.
+app.use((req, res, next) => {
+  const mutating = req.method === "POST" || req.method === "PUT" || req.method === "DELETE";
+  const match = /^\/api\/(stories|orders)(?:\/([^/?]+))?/.exec(req.path);
+  if (mutating && match) {
+    res.on("finish", () => {
+      if (res.statusCode >= 400) return;
+      broadcastEvent({
+        type: match[1] === "stories" ? "story-changed" : "order-changed",
+        // `id` is the affected item for edits, or null for list-level changes
+        // (create/delete) — clients refresh their list either way.
+        id: match[2] ? decodeURIComponent(match[2]) : null,
+        clientId: req.get("x-client-id") || null,
+        by: req.me?.email || null,
+        at: Date.now(),
+      });
+    });
+  }
+  next();
+});
 
 const asyncHandler = (fn) => (req, res) =>
   Promise.resolve(fn(req, res)).catch((err) => {
@@ -1517,6 +1595,9 @@ async function runGenerate({
 }) {
   const genMode = (mode || "compose").toLowerCase();
   const extra = (extraPrompt || "").trim();
+  // The page's own prompt (set in the editor) is the PRIMARY description of what
+  // this page should depict; it leads the generation prompt below.
+  const pagePrompt = (scene.aiPrompt || "").trim();
 
   // A short natural-language descriptor of the child (age + gender) to anchor
   // proportions/identity in the generative prompts.
@@ -1543,6 +1624,15 @@ async function runGenerate({
     const basePrompt =
       genMode === "headswap" ? DEFAULT_PROMPT : genMode === "face" ? FACE_PROMPT : COMPOSE_PROMPT;
     let p = (prompt || basePrompt).trim();
+    // Lead with the page's own prompt so it drives what the scene shows. The
+    // identity, hair and proportion constraints below still lock the child's
+    // likeness regardless of this description.
+    if (pagePrompt) {
+      p =
+        `THIS PAGE DEPICTS: ${pagePrompt} ` +
+        `Treat this as the primary, authoritative description of the page's scene and content. ` +
+        p;
+    }
     p += ` The child is a ${childDesc}; keep age-appropriate, natural proportions with a normal-sized head.`;
     // Hair is a hard identity requirement on every page, regardless of mode or
     // any custom prompt override above.
@@ -1584,6 +1674,8 @@ async function runGenerate({
     }
     const sceneStory = (scene.storyPrompt || "").trim();
     const p = [
+      // Page prompt leads so it primarily shapes the generated scene.
+      pagePrompt,
       prompt?.trim(),
       sceneStory,
       `The main character is a ${childDesc}.`,
@@ -1822,8 +1914,9 @@ function composeExtra(story, scene) {
   return [
     safeZoneGuidance(scene),
     styleDirectives(story?.styleSettings),
-    // Per-page generation prompt set in the editor (AI image only).
-    (scene.aiPrompt || "").trim(),
+    // The per-page prompt (scene.aiPrompt) is intentionally NOT included here:
+    // runGenerate applies it as the PRIMARY scene description (it leads the
+    // prompt) rather than as trailing extra guidance.
     (scene.correction || "").trim(),
   ]
     .filter(Boolean)
@@ -2449,11 +2542,15 @@ async function patchOrderKid(orderId, patch) {
 function hydrateOrder(db, order) {
   const story = db.stories[order.storyId];
   const vars = order.variables || {};
-  const scenes = (story?.scenes || []).map((c) =>
-    c.type === "text" ? { ...c, resolvedText: applyVars(c.text, vars) } : c
-  );
+  // The order's language scopes which book(s) it produces. Legacy orders with no
+  // language fall back to "both" so nothing they already show disappears.
+  const language = ["en", "ar", "both"].includes(order.language) ? order.language : "both";
+  const scenes = (story?.scenes || [])
+    .filter((c) => language === "both" || (c.lang || "en") === language)
+    .map((c) => (c.type === "text" ? { ...c, resolvedText: applyVars(c.text, vars) } : c));
   return {
     ...order,
+    language,
     storyTitle: story?.title || "(deleted story)",
     storyMissing: !story,
     scenes,
@@ -2479,7 +2576,7 @@ app.get(
 app.post(
   "/api/orders",
   asyncHandler(async (req, res) => {
-    const { title, storyId, variables } = req.body || {};
+    const { title, storyId, variables, language } = req.body || {};
     const db = await readDb();
     if (!db.stories[storyId]) return res.status(400).json({ error: "Pick a valid story" });
     if (db.stories[storyId].status !== "published")
@@ -2492,6 +2589,8 @@ app.post(
       id,
       title: (title || "Untitled order").trim(),
       storyId,
+      // Which book(s) this order generates: "en", "ar", or "both".
+      language: ["en", "ar", "both"].includes(language) ? language : "both",
       variables: variables && typeof variables === "object" ? variables : {},
       createdAt: Date.now(),
       kid: null,

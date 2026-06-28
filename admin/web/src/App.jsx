@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { SignedIn, SignedOut, SignIn, UserButton, useAuth } from "@clerk/clerk-react";
-import { api, setAuthTokenGetter } from "./api.js";
+import { api, setAuthTokenGetter, clientId, eventsUrl } from "./api.js";
 import { SYMBOL_LIBRARY, SYMBOL_CATEGORIES, sanitizeSvg, tintSvg } from "./symbols.js";
 import { MODULES, MODULE_IDS } from "./shared/access.js";
 
@@ -111,6 +111,10 @@ function Studio({ me }) {
 
   const [config, setConfig] = useState(null);
   const [error, setError] = useState("");
+  // Auto-save status shown in the story header: "idle" | "saving" | "saved" | "error".
+  const [saveState, setSaveState] = useState("idle");
+  // Set briefly when a live update from the other editor is pulled in.
+  const [livePing, setLivePing] = useState(0);
   const [nav, setNav] = useState(() => {
     const saved = localStorage.getItem("hazawy.nav");
     return saved && allowedModules.includes(saved) ? saved : allowedModules[0] || "orders";
@@ -127,6 +131,7 @@ function Studio({ me }) {
   const [creatingOrder, setCreatingOrder] = useState(false);
   const [newOrderTitle, setNewOrderTitle] = useState("");
   const [newOrderStoryId, setNewOrderStoryId] = useState("");
+  const [newOrderLanguage, setNewOrderLanguage] = useState("en"); // "en" | "ar" | "both"
   const [newOrderVars, setNewOrderVars] = useState({}); // variable name -> value
 
   // Order generation controls
@@ -244,6 +249,90 @@ function Studio({ me }) {
     else localStorage.removeItem("hazawy.orderId");
   }, [order]);
 
+  // Live collaboration: subscribe to the server's change stream so two people
+  // editing the same story/order see each other's saves within ~a second.
+  // Refs keep the EventSource handler reading the latest open item without
+  // re-opening the connection on every keystroke.
+  const storyRef = useRef(null);
+  const orderRef = useRef(null);
+  useEffect(() => {
+    storyRef.current = story;
+  }, [story]);
+  useEffect(() => {
+    orderRef.current = order;
+  }, [order]);
+
+  useEffect(() => {
+    let pingTimer = null;
+    const flashLive = () => {
+      setLivePing((n) => n + 1);
+      clearTimeout(pingTimer);
+      pingTimer = setTimeout(() => setLivePing(0), 1500);
+    };
+
+    const es = new EventSource(eventsUrl());
+    es.onmessage = (e) => {
+      let msg;
+      try {
+        msg = JSON.parse(e.data);
+      } catch {
+        return;
+      }
+      // Ignore our own writes — we already have that state locally.
+      if (!msg || msg.clientId === clientId) return;
+
+      if (msg.type === "story-changed") {
+        refreshStories();
+        const open = storyRef.current;
+        if (open && (msg.id === open.id || msg.id == null)) {
+          if (msg.id === open.id) {
+            api
+              .getStory(open.id)
+              .then((fresh) => {
+                setStory(fresh);
+                flashLive();
+              })
+              .catch(() => {});
+          }
+        }
+      } else if (msg.type === "order-changed") {
+        refreshOrders();
+        const open = orderRef.current;
+        if (open && msg.id === open.id) {
+          api
+            .getOrder(open.id)
+            .then((fresh) => {
+              setOrder(fresh);
+              flashLive();
+            })
+            .catch(() => {});
+        }
+      }
+    };
+    // EventSource auto-reconnects on error; nothing to do but keep it open.
+    return () => {
+      clearTimeout(pingTimer);
+      es.close();
+    };
+  }, []);
+
+  // Wrap a save-causing promise so the header can show "Saving…/Saved".
+  const saveTimer = useRef(null);
+  function trackSave(promise) {
+    setSaveState("saving");
+    return Promise.resolve(promise)
+      .then((result) => {
+        setSaveState("saved");
+        clearTimeout(saveTimer.current);
+        saveTimer.current = setTimeout(() => setSaveState("idle"), 1800);
+        return result;
+      })
+      .catch((err) => {
+        setSaveState("error");
+        throw err;
+      });
+  }
+
   function refreshStories() {
     api.listStories().then(setStories).catch((e) => setError(e.message));
   }
@@ -324,7 +413,7 @@ function Studio({ me }) {
     if (!story) return;
     setError("");
     try {
-      setStory(await api.updateStoryTitle(story.id, titles));
+      setStory(await trackSave(api.updateStoryTitle(story.id, titles)));
       refreshStories();
     } catch (err) {
       setError(err.message);
@@ -335,7 +424,7 @@ function Studio({ me }) {
     if (!story) return;
     setError("");
     try {
-      setStory(await api.updateStoryGender(story.id, gender));
+      setStory(await trackSave(api.updateStoryGender(story.id, gender)));
       refreshStories();
     } catch (err) {
       setError(err.message);
@@ -360,7 +449,7 @@ function Studio({ me }) {
     if (!story) return;
     setError("");
     try {
-      setStory(await api.updateCell(story.id, cellId, { type: "text", text, style }));
+      setStory(await trackSave(api.updateCell(story.id, cellId, { type: "text", text, style })));
       refreshStories();
     } catch (err) {
       setError(err.message);
@@ -372,15 +461,17 @@ function Studio({ me }) {
     setError("");
     try {
       setStory(
-        await api.updateCell(story.id, cellId, {
-          type: "text",
-          elements,
-          safeZones: safeZones ?? [],
-          bgUrl: bgUrl ?? null,
-          bgFalUrl: bgFalUrl ?? null,
-          bgColor: bgColor ?? "#faf7ef",
-          ...(aiPrompt !== undefined ? { aiPrompt } : {}),
-        })
+        await trackSave(
+          api.updateCell(story.id, cellId, {
+            type: "text",
+            elements,
+            safeZones: safeZones ?? [],
+            bgUrl: bgUrl ?? null,
+            bgFalUrl: bgFalUrl ?? null,
+            bgColor: bgColor ?? "#faf7ef",
+            ...(aiPrompt !== undefined ? { aiPrompt } : {}),
+          })
+        )
       );
       refreshStories();
     } catch (err) {
@@ -516,9 +607,13 @@ function Studio({ me }) {
       vars[v.name] = val != null && val !== "" ? val : v.defaultValue || "";
     }
     try {
-      const o = await api.createOrder(newOrderTitle.trim(), newOrderStoryId, { variables: vars });
+      const o = await api.createOrder(newOrderTitle.trim(), newOrderStoryId, {
+        variables: vars,
+        language: newOrderLanguage,
+      });
       setNewOrderTitle("");
       setNewOrderStoryId("");
+      setNewOrderLanguage("en");
       setNewOrderVars({});
       setCreatingOrder(false);
       refreshOrders();
@@ -673,6 +768,8 @@ function Studio({ me }) {
               cellBusy={cellBusy}
               config={config}
               onStoryChange={setStory}
+              saveState={saveState}
+              livePing={livePing}
             />
           )}
 
@@ -790,7 +887,21 @@ function Studio({ me }) {
         </Modal>
       )}
 
-      {creatingOrder && (
+      {creatingOrder && (() => {
+        const selStory = stories.find((s) => s.id === newOrderStoryId);
+        const enCount = (selStory?.scenes || []).filter((s) => (s.lang || "en") === "en").length;
+        const arCount = (selStory?.scenes || []).filter((s) => (s.lang || "en") === "ar").length;
+        const langOpts = [
+          { id: "en", label: "English", count: enCount },
+          { id: "ar", label: "العربية", count: arCount },
+          { id: "both", label: "Both", count: enCount + arCount },
+        ];
+        const emptyLang =
+          selStory &&
+          ((newOrderLanguage === "en" && enCount === 0) ||
+            (newOrderLanguage === "ar" && arCount === 0) ||
+            (newOrderLanguage === "both" && enCount + arCount === 0));
+        return (
         <Modal title="Create order" onClose={() => setCreatingOrder(false)}>
           <label className="block text-xs uppercase tracking-wide text-zinc-500">Order name</label>
           <input
@@ -818,6 +929,31 @@ function Studio({ me }) {
           {stories.filter((s) => s.status === "published").length === 0 && (
             <p className="mt-1 text-xs text-amber-300">
               No published stories yet. Open a story, test it, and publish it before taking orders.
+            </p>
+          )}
+          <label className="mt-3 block text-xs uppercase tracking-wide text-zinc-500">Language</label>
+          <div className="mt-1 grid grid-cols-3 gap-2">
+            {langOpts.map((opt) => (
+              <button
+                key={opt.id}
+                type="button"
+                onClick={() => setNewOrderLanguage(opt.id)}
+                className={`rounded-md border px-3 py-2 text-sm font-medium transition ${
+                  newOrderLanguage === opt.id
+                    ? "border-[var(--color-accent)] bg-[var(--color-accent)]/10 text-[var(--color-accent)]"
+                    : "border-[var(--color-border)] bg-[var(--color-panel-2)] text-zinc-300 hover:bg-[#242838]"
+                }`}
+              >
+                {opt.label}
+                {selStory && <span className="ml-1 text-xs opacity-70">({opt.count})</span>}
+              </button>
+            ))}
+          </div>
+          {emptyLang && (
+            <p className="mt-1 text-xs text-amber-300">
+              This story has no{" "}
+              {newOrderLanguage === "ar" ? "Arabic" : newOrderLanguage === "en" ? "English" : ""} pages
+              yet — there will be nothing to generate.
             </p>
           )}
           {variables.length > 0 && (
@@ -859,7 +995,8 @@ function Studio({ me }) {
             </button>
           </div>
         </Modal>
-      )}
+        );
+      })()}
 
       {creatingVariable && (
         <Modal title="Create variable" onClose={() => setCreatingVariable(false)}>
@@ -1779,6 +1916,13 @@ function StoryTitleField({ lang, value, onSave }) {
     if (t === (value || "").trim()) return;
     onSave(isRtl ? { titleAr: t } : { titleEn: t });
   };
+  // Auto-save while typing: persist ~800ms after the user pauses, so a title is
+  // never lost if they navigate away without blurring the field.
+  useEffect(() => {
+    if (val.trim() === (value || "").trim()) return;
+    const t = setTimeout(commit, 800);
+    return () => clearTimeout(t);
+  }, [val]); // eslint-disable-line react-hooks/exhaustive-deps
   return (
     <div className="mb-3 max-w-md">
       <label className="block text-xs uppercase tracking-wide text-zinc-500">
@@ -1794,6 +1938,33 @@ function StoryTitleField({ lang, value, onSave }) {
         className="mt-1 w-full rounded-md border border-[var(--color-border)] bg-[var(--color-panel-2)] px-3 py-2 text-sm focus:border-[var(--color-accent)] focus:outline-none"
       />
     </div>
+  );
+}
+
+// Small live-status pill: shows auto-save progress and flashes when a change
+// from the other editor is pulled in.
+function SaveIndicator({ saveState, livePing }) {
+  if (livePing) {
+    return (
+      <span className="inline-flex items-center gap-1.5 rounded-full border border-[var(--color-accent)]/40 bg-[var(--color-accent)]/10 px-2.5 py-0.5 text-xs font-medium text-[var(--color-accent)]">
+        <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-[var(--color-accent)]" />
+        Updated live
+      </span>
+    );
+  }
+  const map = {
+    saving: { text: "Saving…", cls: "text-amber-300 border-amber-400/30 bg-amber-400/10" },
+    saved: { text: "Saved", cls: "text-emerald-300 border-emerald-400/30 bg-emerald-400/10" },
+    error: { text: "Save failed", cls: "text-rose-300 border-rose-400/30 bg-rose-400/10" },
+  };
+  const m = map[saveState];
+  if (!m) return null;
+  return (
+    <span
+      className={`inline-flex items-center gap-1.5 rounded-full border px-2.5 py-0.5 text-xs font-medium ${m.cls}`}
+    >
+      {m.text}
+    </span>
   );
 }
 
@@ -1817,6 +1988,8 @@ function StoryDetail({
   cellBusy,
   config,
   onStoryChange,
+  saveState = "idle",
+  livePing = 0,
 }) {
   // Each story holds two independent books — English and Arabic. The tab below
   // scopes the Book layout to the active language; every cell is tagged with
@@ -1892,6 +2065,7 @@ function StoryDetail({
         }
       >
         <StatusPill status={story.status} />
+        <SaveIndicator saveState={saveState} livePing={livePing} />
       </PageHeader>
       <div className="mb-4 flex items-center gap-3">
         <span className="text-xs uppercase tracking-wide text-zinc-500">Child</span>
@@ -2818,8 +2992,103 @@ const FONTS = [
   { id: "arefruqaa", label: "Aref Ruqaa · رقعة", stack: "'Aref Ruqaa', serif", script: "arabic" },
 ];
 const FONT_MAP = Object.fromEntries(FONTS.map((f) => [f.id, f]));
+
+// ── Custom (user-uploaded) fonts ─────────────────────────────────────────────
+// Persisted in localStorage as { id, label, script, dataUrl } and registered
+// with the browser via the FontFace API so they render anywhere fontStack() is
+// used. The id doubles as the CSS font-family name.
+const CUSTOM_FONTS_KEY = "hazawy.customFonts";
+
+function readCustomFontsFromStorage() {
+  try {
+    const list = JSON.parse(localStorage.getItem(CUSTOM_FONTS_KEY) || "[]");
+    return Array.isArray(list) ? list : [];
+  } catch {
+    return [];
+  }
+}
+
+// In-memory cache so fontStack() (called on every text render) stays cheap.
+let customFontCache = readCustomFontsFromStorage();
+function getCustomFonts() {
+  return customFontCache;
+}
+
+const registeredFontIds = new Set();
+function registerCustomFont(f) {
+  if (!f || !f.dataUrl || registeredFontIds.has(f.id) || typeof FontFace === "undefined") return;
+  registeredFontIds.add(f.id);
+  try {
+    const face = new FontFace(f.id, `url(${f.dataUrl})`);
+    face.load().then((loaded) => document.fonts.add(loaded)).catch(() => {});
+  } catch {
+    /* ignore unsupported font files */
+  }
+}
+
+// Register everything we already have on first load.
+customFontCache.forEach(registerCustomFont);
+
+function persistCustomFonts(list) {
+  customFontCache = list;
+  try {
+    localStorage.setItem(CUSTOM_FONTS_KEY, JSON.stringify(list));
+  } catch {
+    /* storage may be full / unavailable */
+  }
+  window.dispatchEvent(new Event("hazawy:customfonts"));
+}
+
+function fileToDataUrl(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result);
+    reader.onerror = reject;
+    reader.readAsDataURL(file);
+  });
+}
+
+// Read a font file, persist it for later use, and register it for rendering.
+async function addCustomFont(file, script) {
+  const dataUrl = await fileToDataUrl(file);
+  const label = file.name.replace(/\.(ttf|otf|woff2?|woff)$/i, "").trim() || "Custom font";
+  const id = `custom_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
+  const font = { id, label, script: script === "arabic" ? "arabic" : "latin", dataUrl, custom: true };
+  registerCustomFont(font);
+  persistCustomFonts([...getCustomFonts(), font]);
+  return font;
+}
+
+function removeCustomFont(id) {
+  persistCustomFonts(getCustomFonts().filter((f) => f.id !== id));
+}
+
+// React binding: re-render consumers when the custom-font list changes.
+function useCustomFonts() {
+  const [fonts, setFonts] = useState(getCustomFonts);
+  useEffect(() => {
+    const sync = () => setFonts(getCustomFonts());
+    window.addEventListener("hazawy:customfonts", sync);
+    window.addEventListener("storage", sync);
+    return () => {
+      window.removeEventListener("hazawy:customfonts", sync);
+      window.removeEventListener("storage", sync);
+    };
+  }, []);
+  return fonts;
+}
+
+// Whether a font belongs to the active language tab. "both" fonts show in either.
+function fontMatchesLang(f, isArabic) {
+  if (f.script === "both") return true;
+  return isArabic ? f.script === "arabic" : f.script !== "arabic";
+}
+
 function fontStack(id) {
-  return (FONT_MAP[id] || FONT_MAP.sans).stack;
+  if (FONT_MAP[id]) return FONT_MAP[id].stack;
+  const custom = getCustomFonts().find((f) => f.id === id);
+  if (custom) return `'${id}', ${custom.script === "arabic" ? "'Cairo', sans-serif" : "sans-serif"}`;
+  return FONT_MAP.sans.stack;
 }
 
 // Text elements may carry rich HTML (for per-selection color). Fall back to
@@ -3241,12 +3510,19 @@ function CellEditor({ cell, label, aspect, variables, customSymbols = [], onSave
   const [symbolPicker, setSymbolPicker] = useState(false);
   const [zones, setZones] = useState(() => (Array.isArray(cell.safeZones) ? cell.safeZones : []));
   const [selectedZoneId, setSelectedZoneId] = useState(null);
+  // The book this page belongs to scopes which fonts are offered: the English
+  // tab shows Latin fonts, the Arabic tab shows Arabic fonts.
+  const isArabic = (cell.lang || "en") === "ar";
+  const customFonts = useCustomFonts();
+  const langFonts = FONTS.filter((f) => fontMatchesLang(f, isArabic));
+  const langCustomFonts = customFonts.filter((f) => fontMatchesLang(f, isArabic));
 
   const canvasRef = useRef(null);
   const areaRef = useRef(null);
   const dragRef = useRef(null);
   const imgInputRef = useRef(null);
   const svgInputRef = useRef(null);
+  const fontInputRef = useRef(null);
   const replaceInputRef = useRef(null);
   // Live contentEditable node + last selection range, for rich-text coloring.
   const editRef = useRef(null);
@@ -3254,6 +3530,8 @@ function CellEditor({ cell, label, aspect, variables, customSymbols = [], onSave
   // Color of the current text selection, shown in the color picker while editing.
   const [selectionColor, setSelectionColor] = useState(null);
   const [area, setArea] = useState({ w: 0, h: 0 });
+  // True while a file is being dragged over the canvas, for the drop highlight.
+  const [dropActive, setDropActive] = useState(false);
 
   const [rw, rh] = ratioNums(aspect);
 
@@ -3488,20 +3766,60 @@ function CellEditor({ cell, label, aspect, variables, customSymbols = [], onSave
   function addText() {
     const el = newTextElement();
     el.z = maxZ() + 1;
+    // Default to a script-appropriate font for the active book.
+    el.font = isArabic ? "cairo" : "sans";
     setElements((e) => [...e, el]);
     setSelectedIds([el.id]);
   }
-  async function addImageFile(file) {
+
+  // Upload a custom font file, tag it for the active language tab, and apply it
+  // to the current selection. It is saved for reuse across sessions.
+  async function handleFontUpload(file) {
+    if (!file) return;
+    try {
+      const font = await addCustomFont(file, isArabic ? "arabic" : "latin");
+      patchSel({ font: font.id });
+    } catch {
+      /* ignore invalid font files */
+    }
+  }
+  // `at` (optional) centers the new image on a drop point, given as { xPct, yPct }.
+  async function addImageFile(file, at) {
     if (!file) return;
     setBusy(true);
     try {
       const { url, falUrl } = await onUploadMedia(file);
       const el = newImageElement(url, falUrl);
       el.z = maxZ() + 1;
+      if (at) {
+        el.xPct = clamp(at.xPct - el.wPct / 2, 0, 100 - el.wPct);
+        el.yPct = clamp(at.yPct - el.hPct / 2, 0, 100 - el.hPct);
+      }
       setElements((e) => [...e, el]);
       setSelectedIds([el.id]);
     } finally {
       setBusy(false);
+    }
+  }
+
+  // Drop image files from the OS straight onto the canvas at the cursor.
+  async function handleCanvasDrop(e) {
+    const files = Array.from(e.dataTransfer?.files || []).filter((f) =>
+      f.type.startsWith("image/")
+    );
+    if (!files.length) return;
+    e.preventDefault();
+    setDropActive(false);
+    const rect = canvasRef.current?.getBoundingClientRect();
+    const xPct = rect ? clamp(((e.clientX - rect.left) / rect.width) * 100, 0, 100) : 50;
+    const yPct = rect ? clamp(((e.clientY - rect.top) / rect.height) * 100, 0, 100) : 50;
+    // Add sequentially so each image stacks on top with a fresh z and a small
+    // offset, instead of landing exactly on top of the previous one.
+    for (let i = 0; i < files.length; i++) {
+      await addImageFile(files[i], {
+        xPct: clamp(xPct + i * 4, 0, 100),
+        yPct: clamp(yPct + i * 4, 0, 100),
+      });
     }
   }
   function addSymbol(svg, name) {
@@ -3774,10 +4092,32 @@ function CellEditor({ cell, label, aspect, variables, customSymbols = [], onSave
                 setEditingId(null);
                 setSelectedZoneId(null);
               }}
+              onDragOver={(e) => {
+                if (!Array.from(e.dataTransfer?.types || []).includes("Files")) return;
+                e.preventDefault();
+                e.dataTransfer.dropEffect = "copy";
+                if (!dropActive) setDropActive(true);
+              }}
+              onDragLeave={(e) => {
+                if (e.currentTarget.contains(e.relatedTarget)) return;
+                setDropActive(false);
+              }}
+              onDrop={handleCanvasDrop}
               className="relative isolate overflow-hidden shadow-2xl shadow-black/50"
               style={{ width: cw, height: ch, containerType: "size", background: bgColor }}
             >
               {bgUrl && <img src={bgUrl} alt="" className="absolute inset-0 z-0 h-full w-full object-cover" />}
+
+              {dropActive && (
+                <div
+                  className="pointer-events-none absolute inset-0 flex items-center justify-center border-2 border-dashed border-[var(--color-accent)] bg-[var(--color-accent)]/10"
+                  style={{ zIndex: 7000 }}
+                >
+                  <span className="rounded-md bg-black/70 px-3 py-1.5 text-sm font-medium text-zinc-100">
+                    Drop image to add
+                  </span>
+                </div>
+              )}
 
               {/* Center snap guides */}
               {snapLines.v && (
@@ -4049,7 +4389,7 @@ function CellEditor({ cell, label, aspect, variables, customSymbols = [], onSave
                   </PanelBtn>
                 ))}
               </div>
-              <div className="flex items-center gap-1">
+              <div className="flex flex-wrap items-center gap-1">
                 <PanelBtn active={selected.bold} onClick={() => patchSel({ bold: !selected.bold })}>
                   B
                 </PanelBtn>
@@ -4062,21 +4402,67 @@ function CellEditor({ cell, label, aspect, variables, customSymbols = [], onSave
                   className="min-w-0 flex-1 rounded bg-[var(--color-panel-2)] px-1.5 py-1 text-xs text-zinc-200 focus:outline-none"
                   style={{ fontFamily: fontStack(selected.font) }}
                 >
-                  <optgroup label="English">
-                    {FONTS.filter((f) => f.script !== "arabic").map((f) => (
+                  <optgroup label={isArabic ? "العربية / Arabic" : "English"}>
+                    {langFonts.map((f) => (
                       <option key={f.id} value={f.id} style={{ fontFamily: f.stack }}>
                         {f.label}
                       </option>
                     ))}
                   </optgroup>
-                  <optgroup label="العربية / Arabic">
-                    {FONTS.filter((f) => f.script === "arabic").map((f) => (
-                      <option key={f.id} value={f.id} style={{ fontFamily: f.stack }}>
-                        {f.label}
-                      </option>
-                    ))}
-                  </optgroup>
+                  {langCustomFonts.length > 0 && (
+                    <optgroup label={isArabic ? "خطوط مخصصة / Custom" : "Custom"}>
+                      {langCustomFonts.map((f) => (
+                        <option key={f.id} value={f.id} style={{ fontFamily: fontStack(f.id) }}>
+                          {f.label}
+                        </option>
+                      ))}
+                    </optgroup>
+                  )}
+                  {/* Keep a font picked for the other script selectable so the
+                      value still renders correctly instead of going blank. */}
+                  {selected.font &&
+                    !langFonts.some((f) => f.id === selected.font) &&
+                    !langCustomFonts.some((f) => f.id === selected.font) && (
+                      <optgroup label="Current">
+                        <option value={selected.font} style={{ fontFamily: fontStack(selected.font) }}>
+                          {FONT_MAP[selected.font]?.label ||
+                            customFonts.find((f) => f.id === selected.font)?.label ||
+                            selected.font}
+                        </option>
+                      </optgroup>
+                    )}
                 </select>
+                <input
+                  ref={fontInputRef}
+                  type="file"
+                  accept=".ttf,.otf,.woff,.woff2,font/ttf,font/otf,font/woff,font/woff2"
+                  className="hidden"
+                  onChange={(e) => {
+                    handleFontUpload(e.target.files?.[0]);
+                    e.target.value = "";
+                  }}
+                />
+                <button
+                  type="button"
+                  title={isArabic ? "رفع خط مخصص" : "Upload a custom font"}
+                  onClick={() => fontInputRef.current?.click()}
+                  className="shrink-0 rounded bg-[var(--color-panel-2)] px-2 py-1 text-xs font-medium text-zinc-200 hover:bg-[#242838]"
+                >
+                  + Font
+                </button>
+                {selected.font && customFonts.some((f) => f.id === selected.font) && (
+                  <button
+                    type="button"
+                    title={isArabic ? "حذف الخط المخصص" : "Delete this custom font"}
+                    onClick={() => {
+                      removeCustomFont(selected.font);
+                      patchSel({ font: isArabic ? "cairo" : "sans" });
+                    }}
+                    className="shrink-0 rounded bg-[var(--color-panel-2)] px-2 py-1 text-xs font-medium text-zinc-400 hover:bg-rose-600/20 hover:text-rose-200"
+                  >
+                    ✕
+                  </button>
+                )}
                 <input
                   type="color"
                   title="Color (selection while editing, else whole text)"
@@ -4182,8 +4568,8 @@ function CellEditor({ cell, label, aspect, variables, customSymbols = [], onSave
                     className="mt-1 w-full resize-y rounded-md border border-[var(--color-border)] bg-[var(--color-panel-2)] px-3 py-2 text-xs leading-relaxed focus:border-[var(--color-accent)] focus:outline-none"
                   />
                   <p className="mt-1 text-[11px] leading-relaxed text-zinc-500">
-                    Extra guidance for generating this page, added on top of the story style. Saved
-                    with the page.
+                    The primary description of what this page should show — it leads the generation
+                    while the child's identity, hair and proportions stay locked. Saved with the page.
                   </p>
                 </div>
               )}
@@ -5104,6 +5490,12 @@ function OrderDetail({
           <p className="text-sm text-zinc-400">
             Story: {order.storyTitle} · {order.scenes.length} scene
             {order.scenes.length === 1 ? "" : "s"}
+            {" · "}
+            {order.language === "ar"
+              ? "العربية"
+              : order.language === "both"
+              ? "English + العربية"
+              : "English"}
             {" · "}
             {order.gender === "male" ? "Boy" : order.gender === "non-binary" ? "Child" : "Girl"}
             {order.age ? `, age ${order.age}` : ""}
