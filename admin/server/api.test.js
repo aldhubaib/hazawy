@@ -104,15 +104,15 @@ test("GET /api/config returns runtime status", async () => {
   assert.equal(typeof body.defaultPrompt, "string");
 });
 
-test("GET /api/access/me grants full page access in open mode", async () => {
+test("GET /api/access/me grants full module access in open mode", async () => {
   const res = await api("/api/access/me");
   assert.equal(res.status, 200);
   const me = await res.json();
   assert.equal(me.isAdmin, true);
-  // The bug we chased: "stories" must be among the pages an admin can open.
-  assert.ok(me.allPages.includes("stories"), "allPages should include stories");
+  // An admin must see every module, including the admin-only ones.
+  assert.ok(me.modules.includes("stories"), "modules should include stories");
   assert.deepEqual(
-    [...me.allPages].sort(),
+    [...me.modules].sort(),
     ["access", "orders", "settings", "stories", "variables"]
   );
 });
@@ -178,12 +178,12 @@ test("access user lifecycle: create, list, reject bad email", async () => {
   const created = await api("/api/access/users", {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ email, role: "member", pages: ["stories", "orders"] }),
+    body: JSON.stringify({ email, role: "member", modules: ["stories", "orders"] }),
   });
   assert.equal(created.status, 200);
   const { user } = await created.json();
   assert.equal(user.email, email);
-  assert.deepEqual(user.pages.sort(), ["orders", "stories"]);
+  assert.deepEqual(user.modules.sort(), ["orders", "stories"]);
 
   const list = await api("/api/access/users");
   assert.equal(list.status, 200);

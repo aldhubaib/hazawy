@@ -38,6 +38,20 @@ import {
   validateKidPhoto,
   derivePhotoStatus,
 } from "./checker.js";
+// Shared access model — the single source of truth for modules/roles/can(),
+// imported by the web client too (see web/src/shared/access.js).
+import {
+  MODULES,
+  MODULE_IDS,
+  ASSIGNABLE_MODULES,
+  ADMIN_ONLY_MODULES,
+  ROLES,
+  normalizeRole,
+  normalizeEmail,
+  sanitizeModules,
+  can,
+  visibleModules,
+} from "../web/src/shared/access.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 // DATA_ROOT lets a host (e.g. Railway volume) point persistent storage at a
@@ -204,10 +218,12 @@ const GPT_IMAGE_ANCHOR_PROMPT =
   "If the input photo has makeup, beauty filter, or stylization, reduce those artifacts while preserving identity. " +
   "Return one realistic, age-appropriate child portrait.";
 
-// Which provider generates the identity anchor. Defaults to the existing Nano
-// Banana behavior. Set ANCHOR_PROVIDER=gpt_image_2 (or ANCHOR_MODEL to the fal
-// endpoint "openai/gpt-image-2/edit") to use GPT-Image-2 via fal.
-function useGptImageAnchor() {
+// Which fal model the user selected in Settings ("Model"). Drives BOTH the
+// identity anchor and the actual scene/page generation so the selected model is
+// what really renders the output. Defaults to the existing Nano Banana behavior.
+// Set ANCHOR_PROVIDER=gpt_image_2 (or ANCHOR_MODEL to the fal endpoint
+// "openai/gpt-image-2/edit") to use GPT-Image-2 via fal.
+function useGptImageModel() {
   const provider = (process.env.ANCHOR_PROVIDER || "nano_banana").toLowerCase();
   const model = (process.env.ANCHOR_MODEL || "").toLowerCase();
   return provider === "gpt_image_2" || model === GPT_IMAGE_2_ENDPOINT;
@@ -259,11 +275,8 @@ app.use(express.json());
 // ---------------------------------------------------------------------------
 // Access control (Clerk)
 // ---------------------------------------------------------------------------
-// Pages that map to side-menu sections. "settings" and "access" are admin-only
-// and never assignable to members; the rest can be granted per-person.
-const ALL_PAGES = ["stories", "orders", "variables", "settings", "access"];
-const ASSIGNABLE_PAGES = ["stories", "orders", "variables"];
-const ADMIN_ONLY_PAGES = ["settings", "access"];
+// The module/role model and the can() decision live in the shared access module
+// (imported above) so the server and the web client agree by construction.
 
 // Auth is only enforced when a Clerk secret key is configured, so the tool still
 // runs locally with zero setup. Add CLERK_SECRET_KEY to turn on real access.
@@ -271,17 +284,22 @@ const AUTH_ENABLED = Boolean(process.env.CLERK_SECRET_KEY);
 
 const ADMIN_EMAILS = (process.env.ADMIN_EMAILS || "")
   .split(",")
-  .map((s) => s.trim().toLowerCase())
+  .map(normalizeEmail)
   .filter(Boolean);
 
-// Map an API path to the page permission it requires. Anything not listed is
+// Map an API path prefix to the module it belongs to. Anything not listed is
 // open to any signed-in user (config, media uploads, "who am I", etc.).
-const ROUTE_PAGE = [
+// can() then decides access uniformly (admin-only vs granted-to-member).
+const ROUTE_MODULE = [
   [/^\/api\/stories(\/|$)/, "stories"],
   [/^\/api\/orders(\/|$)/, "orders"],
   [/^\/api\/variables(\/|$)/, "variables"],
   [/^\/api\/settings(\/|$)/, "settings"],
+  [/^\/api\/access(\/|$)/, "access"],
 ];
+
+// Endpoints any signed-in user may hit regardless of module grants.
+const OPEN_ENDPOINTS = new Set(["/api/config", "/api/media", "/api/access/me"]);
 
 if (AUTH_ENABLED) app.use(clerkMiddleware());
 
@@ -290,18 +308,28 @@ const emailByUserId = new Map();
 async function emailForUser(userId) {
   if (emailByUserId.has(userId)) return emailByUserId.get(userId);
   const user = await clerkClient.users.getUser(userId);
-  const email = (
-    user.primaryEmailAddress?.emailAddress ||
-    user.emailAddresses?.[0]?.emailAddress ||
-    ""
-  ).toLowerCase();
-  emailByUserId.set(userId, email);
+  const email = normalizeEmail(
+    user.primaryEmailAddress?.emailAddress || user.emailAddresses?.[0]?.emailAddress
+  );
+  // Only memoize a real address — never cache an empty string, or a transient
+  // miss would wrongly stick to this session and strip the user's access.
+  if (email) emailByUserId.set(userId, email);
   return email;
 }
 
-// Resolve the signed-in person into { email, role, isAdmin, pages }. The very
-// first person to sign in (or anyone in ADMIN_EMAILS) is bootstrapped as admin
-// and persisted, so there's always someone who can manage access.
+// Find the stored record for a signed-in person. Primary match is the
+// normalized email key; the secondary match by stable Clerk userId covers a
+// user whose email later changed in Clerk (their record keeps working).
+function findRecord(users, email, userId) {
+  if (email && users[email]) return users[email];
+  if (userId) return Object.values(users).find((u) => u.userId === userId) || null;
+  return null;
+}
+
+// Resolve the signed-in person into a viewer: { email, userId, role, isAdmin,
+// modules }. The first person to sign in (or anyone in ADMIN_EMAILS) is
+// bootstrapped as admin and persisted, so there's always someone who can manage
+// access. Returns null when not signed in.
 async function resolveUser(req) {
   const { isAuthenticated, userId } = getAuth(req);
   if (!isAuthenticated) return null;
@@ -312,69 +340,73 @@ async function resolveUser(req) {
   if (!db.access.users) db.access.users = {};
   const users = db.access.users;
 
-  let record = email ? users[email] : null;
-  const forcedAdmin = email && ADMIN_EMAILS.includes(email);
+  const forcedAdmin = Boolean(email && ADMIN_EMAILS.includes(email));
   const noUsersYet = Object.keys(users).length === 0;
 
+  let record = findRecord(users, email, userId);
+  let dirty = false;
+
   if (!record && email && (forcedAdmin || noUsersYet)) {
+    // Bootstrap: guarantee at least one admin exists.
     record = {
       email,
+      userId,
       role: "admin",
-      pages: ASSIGNABLE_PAGES.slice(),
+      modules: ASSIGNABLE_MODULES.slice(),
       invitedAt: Date.now(),
       bootstrapped: true,
     };
     users[email] = record;
-    await writeDb(db);
-  } else if (record && forcedAdmin && record.role !== "admin") {
-    record.role = "admin";
-    await writeDb(db);
+    dirty = true;
+  } else if (record) {
+    // Promote configured admins, stamp the stable userId on first sign-in, and
+    // migrate legacy "pages" records to the new "modules" field — once.
+    if (forcedAdmin && record.role !== "admin") {
+      record.role = "admin";
+      dirty = true;
+    }
+    if (userId && record.userId !== userId) {
+      record.userId = userId;
+      dirty = true;
+    }
+    if (!Array.isArray(record.modules)) {
+      record.modules = sanitizeModules(record.pages);
+      delete record.pages;
+      dirty = true;
+    }
   }
+  if (dirty) await writeDb(db);
 
-  const isAdmin = record?.role === "admin" || forcedAdmin;
-  const pages = isAdmin
-    ? ALL_PAGES.slice()
-    : (record?.pages || []).filter((p) => ASSIGNABLE_PAGES.includes(p));
-
-  // #region agent log
-  try {
-    const _p = { sessionId: '1a21d9', runId: 'pre-fix', hypothesisId: 'A,B,C', location: 'server/index.js:resolveUser', message: 'resolved user', data: { userId, resolvedEmail: email, recordExists: Boolean(record), recordRole: record?.role || null, recordEmailKey: record?.email || null, knownUserEmails: Object.keys(users), forcedAdmin, isAdmin, pages }, timestamp: Date.now() };
-    console.log('[agent-log]', JSON.stringify(_p));
-    fetch('http://127.0.0.1:7678/ingest/f54dfce7-ecd1-4bb5-989f-445348e0d26e', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Debug-Session-Id': '1a21d9' }, body: JSON.stringify(_p) }).catch(() => {});
-  } catch {}
-  // #endregion
-
-  return { email, userId, role: isAdmin ? "admin" : "member", isAdmin, pages, exists: Boolean(record) };
+  const role = record?.role === "admin" || forcedAdmin ? "admin" : "member";
+  const user = {
+    email,
+    userId,
+    role,
+    modules: role === "admin" ? ASSIGNABLE_MODULES.slice() : sanitizeModules(record?.modules),
+  };
+  // visibleModules() expands admins to admin-only modules too, via can().
+  return { ...user, isAdmin: role === "admin", modules: visibleModules(user), exists: Boolean(record) };
 }
 
-// Gate /api routes by the page they belong to. Skips itself when auth is off.
+// Gate /api routes by the module they belong to, using the shared can(). Skips
+// itself when auth is off so the tool runs fully open with zero setup.
 app.use(async (req, res, next) => {
   if (!AUTH_ENABLED) return next();
   if (!req.path.startsWith("/api/")) return next();
 
-  // Always-open endpoints for any signed-in user.
-  const open = ["/api/config", "/api/media", "/api/access/me"];
   try {
     const me = await resolveUser(req);
     if (!me) return res.status(401).json({ error: "Sign in required." });
     req.me = me;
 
-    if (open.includes(req.path)) return next();
+    if (OPEN_ENDPOINTS.has(req.path)) return next();
 
-    if (req.path.startsWith("/api/access")) {
-      if (!me.isAdmin) return res.status(403).json({ error: "Admins only." });
-      return next();
-    }
-
-    const rule = ROUTE_PAGE.find(([re]) => re.test(req.path));
-    if (rule) {
-      const page = rule[1];
-      if (ADMIN_ONLY_PAGES.includes(page) && !me.isAdmin) {
-        return res.status(403).json({ error: "Admins only." });
-      }
-      if (!me.isAdmin && !me.pages.includes(page)) {
-        return res.status(403).json({ error: `No access to "${page}".` });
-      }
+    const rule = ROUTE_MODULE.find(([re]) => re.test(req.path));
+    if (rule && !can(me, rule[1])) {
+      const moduleId = rule[1];
+      return res.status(403).json({
+        error: MODULES[moduleId].adminOnly ? "Admins only." : `No access to "${moduleId}".`,
+      });
     }
     return next();
   } catch (err) {
@@ -547,16 +579,27 @@ app.post(
 );
 
 // --- Access / team ------------------------------------------------------------
-const PAGE_META = {
+// Static description of the access model, sent alongside every access response
+// so the client can render labels/icons/role options without duplicating them.
+const ACCESS_META = {
   authEnabled: AUTH_ENABLED,
-  allPages: ALL_PAGES,
-  assignablePages: ASSIGNABLE_PAGES,
-  adminOnlyPages: ADMIN_ONLY_PAGES,
+  modules: MODULES,
+  moduleIds: MODULE_IDS,
+  assignableModules: ASSIGNABLE_MODULES,
+  adminOnlyModules: ADMIN_ONLY_MODULES,
+  roles: ROLES,
 };
 
-function sanitizePages(pages) {
-  if (!Array.isArray(pages)) return [];
-  return [...new Set(pages)].filter((p) => ASSIGNABLE_PAGES.includes(p));
+// Normalize a stored record for the wire: ensure a `modules` array (migrating
+// the legacy `pages` field) and drop internal-only bookkeeping.
+function publicUser(record) {
+  const role = record.role === "admin" ? "admin" : "member";
+  return {
+    email: record.email,
+    role,
+    modules: role === "admin" ? ASSIGNABLE_MODULES.slice() : sanitizeModules(record.modules ?? record.pages),
+    invitedAt: record.invitedAt || 0,
+  };
 }
 
 // Who the current request is. When auth is disabled this returns a synthetic
@@ -565,35 +608,11 @@ app.get(
   "/api/access/me",
   asyncHandler(async (req, res) => {
     if (!AUTH_ENABLED) {
-      return res.json({
-        ...PAGE_META,
-        email: "",
-        role: "admin",
-        isAdmin: true,
-        pages: ASSIGNABLE_PAGES.slice(),
-      });
+      const user = { email: "", role: "admin", modules: ASSIGNABLE_MODULES.slice() };
+      return res.json({ ...ACCESS_META, ...user, isAdmin: true, modules: visibleModules(user) });
     }
     const me = req.me;
-    // #region agent log
-    let _debug;
-    try {
-      const db = await readDb();
-      const users = db.access?.users || {};
-      _debug = {
-        resolvedEmail: me.email,
-        isAdmin: me.isAdmin,
-        role: me.role,
-        pages: me.pages,
-        recordExistsForResolvedEmail: Boolean(users[me.email]),
-        knownUserEmails: Object.keys(users),
-        adminEmailsConfigured: ADMIN_EMAILS,
-      };
-      const _p = { sessionId: '1a21d9', runId: 'pre-fix', hypothesisId: 'A,B,C,D', location: 'server/index.js:/api/access/me', message: 'access/me response', data: _debug, timestamp: Date.now() };
-      console.log('[agent-log]', JSON.stringify(_p));
-      fetch('http://127.0.0.1:7678/ingest/f54dfce7-ecd1-4bb5-989f-445348e0d26e', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Debug-Session-Id': '1a21d9' }, body: JSON.stringify(_p) }).catch(() => {});
-    } catch {}
-    // #endregion
-    res.json({ ...PAGE_META, email: me.email, role: me.role, isAdmin: me.isAdmin, pages: me.pages, _debug });
+    res.json({ ...ACCESS_META, email: me.email, role: me.role, isAdmin: me.isAdmin, modules: me.modules });
   })
 );
 
@@ -601,22 +620,23 @@ app.get(
   "/api/access/users",
   asyncHandler(async (_req, res) => {
     const db = await readDb();
-    const users = Object.values(db.access?.users || {}).sort(
-      (a, b) => (b.invitedAt || 0) - (a.invitedAt || 0)
-    );
-    res.json({ ...PAGE_META, users });
+    const users = Object.values(db.access?.users || {})
+      .sort((a, b) => (b.invitedAt || 0) - (a.invitedAt || 0))
+      .map(publicUser);
+    res.json({ ...ACCESS_META, users });
   })
 );
 
 app.post(
   "/api/access/users",
   asyncHandler(async (req, res) => {
-    const email = String(req.body?.email || "").trim().toLowerCase();
+    const email = normalizeEmail(req.body?.email);
     if (!email || !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) {
       return res.status(400).json({ error: "A valid email is required." });
     }
-    const role = req.body?.role === "admin" ? "admin" : "member";
-    const pages = role === "admin" ? ASSIGNABLE_PAGES.slice() : sanitizePages(req.body?.pages);
+    const role = normalizeRole(req.body?.role);
+    const modules =
+      role === "admin" ? ASSIGNABLE_MODULES.slice() : sanitizeModules(req.body?.modules ?? req.body?.pages);
 
     const db = await readDb();
     if (!db.access) db.access = { users: {} };
@@ -624,16 +644,16 @@ app.post(
     if (db.access.users[email]) {
       return res.status(409).json({ error: "That person already has access." });
     }
-    db.access.users[email] = { email, role, pages, invitedAt: Date.now() };
+    db.access.users[email] = { email, role, modules, invitedAt: Date.now() };
     await writeDb(db);
-    res.json({ ok: true, user: db.access.users[email] });
+    res.json({ ok: true, user: publicUser(db.access.users[email]) });
   })
 );
 
 app.put(
   "/api/access/users/:email",
   asyncHandler(async (req, res) => {
-    const email = String(req.params.email || "").trim().toLowerCase();
+    const email = normalizeEmail(req.params.email);
     const db = await readDb();
     const record = db.access?.users?.[email];
     if (!record) return res.status(404).json({ error: "User not found." });
@@ -643,19 +663,21 @@ app.put(
       return res.status(400).json({ error: "You can't remove your own admin access." });
     }
 
-    if (req.body?.role) record.role = req.body.role === "admin" ? "admin" : "member";
-    if (record.role === "admin") record.pages = ASSIGNABLE_PAGES.slice();
-    else if (Array.isArray(req.body?.pages)) record.pages = sanitizePages(req.body.pages);
+    if (req.body?.role !== undefined) record.role = normalizeRole(req.body.role);
+    const incomingModules = req.body?.modules ?? req.body?.pages;
+    if (record.role === "admin") record.modules = ASSIGNABLE_MODULES.slice();
+    else if (Array.isArray(incomingModules)) record.modules = sanitizeModules(incomingModules);
+    delete record.pages; // drop the legacy field once touched
 
     await writeDb(db);
-    res.json({ ok: true, user: record });
+    res.json({ ok: true, user: publicUser(record) });
   })
 );
 
 app.delete(
   "/api/access/users/:email",
   asyncHandler(async (req, res) => {
-    const email = String(req.params.email || "").trim().toLowerCase();
+    const email = normalizeEmail(req.params.email);
     if (AUTH_ENABLED && req.me?.email === email) {
       return res.status(400).json({ error: "You can't remove your own access." });
     }
@@ -1269,7 +1291,7 @@ async function runAnchor(kid, anchorPrompt) {
   // Identity source: restored photo only when restore was accepted ("used");
   // skipped/discarded leave restoredFalUrl null, so this resolves to the raw
   // uploaded photo — exactly the required behavior.
-  const useGptImage = useGptImageAnchor();
+  const useGptImage = useGptImageModel();
   const provider = useGptImage ? "gpt_image_2" : "nano_banana";
   const identityPrompt = useGptImage
     ? (anchorPrompt || GPT_IMAGE_ANCHOR_PROMPT).trim()
@@ -1532,6 +1554,22 @@ async function runGenerate({
         " Reproduce these features faithfully; do not invent or average them.";
     }
     if (extra) p += ` ${extra}`;
+    // Honor the model selected in Settings: GPT-Image-2 edits the scene with the
+    // same scene-base-first, references-after ordering; otherwise Nano Banana.
+    if (useGptImageModel()) {
+      const g = await gptImage2Edit({
+        imageUrls: [scene.falUrl, ...useRefs],
+        prompt: p,
+        imageSize: "auto",
+        quality: "medium",
+        outputFormat: "png",
+      });
+      return {
+        out: { url: g.url, description: GPT_IMAGE_2_ENDPOINT },
+        method: `edit:${genMode}`,
+        usedPrompt: p,
+      };
+    }
     const r = await nanoEdit({ imageUrls: [scene.falUrl, ...useRefs], prompt: p });
     return { out: r, method: `edit:${genMode}`, usedPrompt: p };
   };

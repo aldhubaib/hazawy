@@ -2,16 +2,10 @@ import { useEffect, useRef, useState } from "react";
 import { SignedIn, SignedOut, SignIn, UserButton, useAuth } from "@clerk/clerk-react";
 import { api, setAuthTokenGetter } from "./api.js";
 import { SYMBOL_LIBRARY, SYMBOL_CATEGORIES, sanitizeSvg, tintSvg } from "./symbols.js";
+import { MODULES, MODULE_IDS } from "./shared/access.js";
 
-// Page ids that can be granted to members; admins additionally see these.
-const ADMIN_ONLY_PAGES = ["settings", "access"];
-const PAGE_LABELS = {
-  stories: "Stories",
-  orders: "Orders",
-  variables: "Variables",
-  settings: "Settings",
-  access: "Access",
-};
+// Human-readable label for a module id (falls back to the id itself).
+const moduleLabel = (id) => MODULES[id]?.label || id;
 
 // Parse the current URL hash into a section + optional id, e.g. "#/orders/123".
 function parseHash() {
@@ -110,16 +104,16 @@ function StudioLoader({ ready, withUserButton }) {
 }
 
 function Studio({ me }) {
-  const allowedPages = me.isAdmin
-    ? [...new Set([...(me.pages || []), ...ADMIN_ONLY_PAGES])]
-    : me.pages || [];
-  const canAccess = (page) => allowedPages.includes(page);
+  // The server already resolved exactly which modules this user can open
+  // (via the shared can()/visibleModules); the client just trusts that list.
+  const allowedModules = me.modules || [];
+  const canAccess = (moduleId) => allowedModules.includes(moduleId);
 
   const [config, setConfig] = useState(null);
   const [error, setError] = useState("");
   const [nav, setNav] = useState(() => {
     const saved = localStorage.getItem("hazawy.nav");
-    return saved && allowedPages.includes(saved) ? saved : allowedPages[0] || "orders";
+    return saved && allowedModules.includes(saved) ? saved : allowedModules[0] || "orders";
   }); // "stories" | "orders"
 
   const [stories, setStories] = useState([]);
@@ -239,7 +233,7 @@ function Studio({ me }) {
 
   // Never sit on a page the user can't access (e.g. after a hash change).
   useEffect(() => {
-    if (!canAccess(nav)) setNav(allowedPages[0] || "orders");
+    if (!canAccess(nav)) setNav(allowedModules[0] || "orders");
   }, [nav]);
   useEffect(() => {
     if (story) localStorage.setItem("hazawy.storyId", story.id);
@@ -965,17 +959,14 @@ function VariablesTable({ variables, onDelete, onCreate }) {
 
 /* ============================ NAV SIDEBAR ============================ */
 function NavSidebar({ nav, onNav, config, me }) {
-  const allItems = [
-    { id: "stories", label: "Stories", icon: "📖" },
-    { id: "orders", label: "Orders", icon: "🧾" },
-    { id: "variables", label: "Variables", icon: "🔤" },
-    { id: "settings", label: "Settings", icon: "⚙️", adminOnly: true },
-    { id: "access", label: "Access", icon: "👥", adminOnly: true },
-  ];
-  const allowed = me?.isAdmin
-    ? [...new Set([...(me?.pages || []), ...ADMIN_ONLY_PAGES])]
-    : me?.pages || [];
-  const items = allItems.filter((it) => allowed.includes(it.id));
+  // Render straight from the modules the server granted, in their declared
+  // order, using the shared MODULES metadata for label + icon.
+  const allowed = me?.modules || [];
+  const items = MODULE_IDS.filter((id) => allowed.includes(id)).map((id) => ({
+    id,
+    label: MODULES[id].label,
+    icon: MODULES[id].icon,
+  }));
 
   return (
     <aside className="flex w-64 flex-col border-r border-[var(--color-border)] bg-[var(--color-panel)]">
@@ -1026,10 +1017,10 @@ function AccessPage({ me, onError }) {
   const [data, setData] = useState(null);
   const [email, setEmail] = useState("");
   const [role, setRole] = useState("member");
-  const [pages, setPages] = useState(["stories", "orders"]);
+  const [modules, setModules] = useState(["stories", "orders"]);
   const [inviting, setInviting] = useState(false);
 
-  const assignable = data?.assignablePages || ["stories", "orders", "variables"];
+  const assignable = data?.assignableModules || ["stories", "orders", "variables"];
 
   function load() {
     api
@@ -1042,8 +1033,8 @@ function AccessPage({ me, onError }) {
     load();
   }, []);
 
-  function togglePage(set, setter, page) {
-    setter(set.includes(page) ? set.filter((p) => p !== page) : [...set, page]);
+  function toggleModule(set, setter, moduleId) {
+    setter(set.includes(moduleId) ? set.filter((p) => p !== moduleId) : [...set, moduleId]);
   }
 
   async function invite() {
@@ -1054,11 +1045,11 @@ function AccessPage({ me, onError }) {
     try {
       await api.inviteAccessUser(trimmed, {
         role,
-        pages: role === "admin" ? assignable : pages,
+        modules: role === "admin" ? assignable : modules,
       });
       setEmail("");
       setRole("member");
-      setPages(["stories", "orders"]);
+      setModules(["stories", "orders"]);
       load();
     } catch (e) {
       onError?.(e.message);
@@ -1137,9 +1128,9 @@ function AccessPage({ me, onError }) {
               {assignable.map((p) => (
                 <PageChip
                   key={p}
-                  label={PAGE_LABELS[p] || p}
-                  active={pages.includes(p)}
-                  onClick={() => togglePage(pages, setPages, p)}
+                  label={moduleLabel(p)}
+                  active={modules.includes(p)}
+                  onClick={() => toggleModule(modules, setModules, p)}
                 />
               ))}
             </div>
@@ -1194,20 +1185,20 @@ function AccessPage({ me, onError }) {
                     </div>
 
                     {u.role === "admin" ? (
-                      <div className="text-xs text-zinc-500">Full access to all pages.</div>
+                      <div className="text-xs text-zinc-500">Full access to all modules.</div>
                     ) : (
                       <div className="flex flex-wrap gap-2">
                         {assignable.map((p) => (
                           <PageChip
                             key={p}
-                            label={PAGE_LABELS[p] || p}
-                            active={(u.pages || []).includes(p)}
+                            label={moduleLabel(p)}
+                            active={(u.modules || []).includes(p)}
                             onClick={() => {
-                              const current = u.pages || [];
-                              const nextPages = current.includes(p)
+                              const current = u.modules || [];
+                              const nextModules = current.includes(p)
                                 ? current.filter((x) => x !== p)
                                 : [...current, p];
-                              changeUser(u.email, { pages: nextPages });
+                              changeUser(u.email, { modules: nextModules });
                             }}
                           />
                         ))}

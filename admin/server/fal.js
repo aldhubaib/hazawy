@@ -85,17 +85,25 @@ export const GPT_IMAGE_2_ENDPOINT = "openai/gpt-image-2/edit";
 
 export async function gptImage2Edit({
   imageUrl,
+  imageUrls,
   prompt,
   imageSize = "square_hd",
   quality = "medium",
   outputFormat = "png",
 }) {
   ensureConfigured();
+  // Accept either a single `imageUrl` (anchor portrait) or an ordered list via
+  // `imageUrls` (scene base first, then identity reference photos). `auto` lets
+  // the model infer dimensions from the inputs so scene aspect ratios survive.
+  const urls = (Array.isArray(imageUrls) && imageUrls.length ? imageUrls : [imageUrl]).filter(
+    Boolean
+  );
+  if (!urls.length) throw new Error("gpt-image-2 edit requires at least one image URL");
   const result = await fal.subscribe(GPT_IMAGE_2_ENDPOINT, {
     input: {
       prompt,
-      image_urls: [imageUrl],
-      image_size: imageSize,
+      image_urls: urls,
+      ...(imageSize ? { image_size: imageSize } : {}),
       quality,
       num_images: 1,
       output_format: outputFormat,
