@@ -25,6 +25,8 @@ function freePort() {
 let serverProc;
 let baseUrl;
 let dataRoot;
+let envPath;
+let envBackup; // null = file didn't exist before the test
 
 const api = (path, init) => fetch(`${baseUrl}${path}`, init);
 
@@ -33,6 +35,15 @@ before(async () => {
   baseUrl = `http://127.0.0.1:${port}`;
   // Isolated datastore so the test never reads or clobbers real dev data.
   dataRoot = await fs.mkdtemp(path.join(os.tmpdir(), "hazawy-test-"));
+
+  // Saving settings writes a best-effort copy to server/.env. Snapshot it so we
+  // can restore it afterward and never disturb the developer's real config.
+  envPath = path.join(__dirname, ".env");
+  try {
+    envBackup = await fs.readFile(envPath, "utf8");
+  } catch {
+    envBackup = null;
+  }
 
   serverProc = spawn("node", ["index.js"], {
     cwd: __dirname,
@@ -47,6 +58,8 @@ before(async () => {
       DATABASE_URL: "",
       FAL_KEY: "",
       GEMINI_API_KEY: "",
+      // Deterministic default so the model setting starts at "nano_banana".
+      ANCHOR_PROVIDER: "",
     },
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -75,6 +88,11 @@ before(async () => {
 after(async () => {
   if (serverProc && serverProc.exitCode === null) serverProc.kill("SIGKILL");
   if (dataRoot) await fs.rm(dataRoot, { recursive: true, force: true });
+  // Restore (or remove) server/.env so the test leaves no trace.
+  if (envPath) {
+    if (envBackup === null) await fs.rm(envPath, { force: true });
+    else await fs.writeFile(envPath, envBackup, "utf8");
+  }
 });
 
 test("GET /api/config returns runtime status", async () => {
@@ -103,6 +121,41 @@ test("GET /api/stories returns a list", async () => {
   const res = await api("/api/stories");
   assert.equal(res.status, 200);
   assert.ok(Array.isArray(await res.json()));
+});
+
+test("GET /api/settings reports model + key status", async () => {
+  const res = await api("/api/settings");
+  assert.equal(res.status, 200);
+  const s = await res.json();
+  assert.equal(s.anchorProvider, "nano_banana"); // deterministic default
+  assert.equal(s.falKey.set, false); // FAL_KEY forced empty for the test
+  assert.equal(typeof s.checkerEnabled, "boolean");
+});
+
+test("PUT /api/settings changes the model and it round-trips", async () => {
+  const put = await api("/api/settings", {
+    method: "PUT",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ anchorProvider: "gpt_image_2" }),
+  });
+  assert.equal(put.status, 200);
+  const saved = await put.json();
+  assert.equal(saved.ok, true);
+  assert.equal(saved.anchorProvider, "gpt_image_2");
+
+  // A fresh read reflects the saved model.
+  const res = await api("/api/settings");
+  const s = await res.json();
+  assert.equal(s.anchorProvider, "gpt_image_2");
+});
+
+test("PUT /api/settings rejects an unknown model", async () => {
+  const res = await api("/api/settings", {
+    method: "PUT",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ anchorProvider: "not_a_real_model" }),
+  });
+  assert.equal(res.status, 400);
 });
 
 test("access user lifecycle: create, list, reject bad email", async () => {
