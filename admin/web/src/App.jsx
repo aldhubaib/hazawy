@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import { SignedIn, SignedOut, SignIn, UserButton, useAuth } from "@clerk/clerk-react";
 import {
   AsYouType,
@@ -4464,6 +4465,7 @@ function StoryDetail({
   const [bookLang, setBookLang] = useState("en");
   const [publishing, setPublishing] = useState(false);
   const [copyingLang, setCopyingLang] = useState(false);
+  const [printCells, setPrintCells] = useState(null);
   const langCells = (story.scenes || []).filter((s) => (s.lang || "en") === bookLang);
   const isRtl = bookLang === "ar";
   const isPublished = story.status === "published";
@@ -4570,6 +4572,7 @@ function StoryDetail({
         );
       })()}
       <Section step="" title="Book layout">
+        <BookPrint cells={printCells} onDone={() => setPrintCells(null)} />
         <div className="mb-4 flex w-full max-w-xs gap-1 rounded-md border border-[var(--color-border)] bg-[var(--color-panel-2)] p-1">
           {[
             { id: "en", label: "English" },
@@ -4637,6 +4640,16 @@ function StoryDetail({
               {analyzing ? "Analyzing…" : "✦ Analyze scenes"}
             </button>
           )}
+          {langCells.length > 0 && (
+            <button
+              onClick={() => setPrintCells(langCells)}
+              disabled={!!printCells}
+              title="Export this book to a print-ready PDF (one A3 landscape page per sheet)"
+              className="rounded-md border border-[var(--color-border)] bg-[var(--color-panel-2)] px-3 py-1.5 text-xs font-medium hover:bg-[#242838] disabled:opacity-40"
+            >
+              {printCells ? "Preparing…" : "⬇ Export PDF (A3)"}
+            </button>
+          )}
           <span className="text-[11px] text-zinc-600">
             Analyze sets each page to{" "}
             <span className="text-emerald-300/80">strict</span> /{" "}
@@ -4651,7 +4664,6 @@ function StoryDetail({
               aspect={story.aspect || "3:4"}
               variables={variables}
               cellBusy={cellBusy}
-              rtl={isRtl}
               onUploadImage={onUploadCellImage}
               onUploadBackground={onUploadCellBackground}
               onRemoveBackground={onRemoveCellBackground}
@@ -5354,7 +5366,6 @@ function CellBook({
   aspect,
   variables,
   cellBusy,
-  rtl = false,
   onUploadImage,
   onUploadBackground,
   onRemoveBackground,
@@ -5380,6 +5391,17 @@ function CellBook({
     onReorder(ids);
   }
 
+  // Explicit reorder via the up/down buttons (dir = -1 up, +1 down).
+  function moveBy(id, dir) {
+    const ids = cells.map((s) => s.id);
+    const from = ids.indexOf(id);
+    const to = from + dir;
+    if (from === -1 || to < 0 || to >= ids.length) return;
+    ids.splice(from, 1);
+    ids.splice(to, 0, id);
+    onReorder(ids);
+  }
+
   const dragProps = (id) => ({
     isDragging: dragId === id,
     isOver: overId === id && dragId !== id,
@@ -5401,26 +5423,22 @@ function CellBook({
   });
 
   // Each page IS one printed sheet — two book pages the press prints together
-  // (left + right halves). The first sheet is the cover wrap: back cover on the
-  // left, front cover on the right.
+  // (left + right halves). The first sheet is the cover wrap.
   return (
     <div className="space-y-4">
       {cells.map((cell, i) => {
-        const isCover = i === 0;
-        // Semantic sides (same data model in both languages): the RIGHT side is
-        // the front cover / odd page; the LEFT side is the back cover / even page.
-        const leftLabel = isCover ? "Back cover" : `Page ${i * 2}`;
-        const rightLabel = isCover ? "Front cover" : `Page ${i * 2 + 1}`;
         return (
           <Cell
             key={cell.id}
             cell={cell}
             ratio={ratio}
-            leftLabel={leftLabel}
-            rightLabel={rightLabel}
-            mirror={rtl}
+            label={`Page ${i + 1}`}
             variables={variables}
             busy={!!cellBusy[cell.id]}
+            canMoveUp={i > 0}
+            canMoveDown={i < cells.length - 1}
+            onMoveUp={() => moveBy(cell.id, -1)}
+            onMoveDown={() => moveBy(cell.id, 1)}
             onUploadImage={onUploadImage}
             onUploadBackground={onUploadBackground}
             onRemoveBackground={onRemoveBackground}
@@ -6021,44 +6039,60 @@ function PrintSpecGuides({ solid = false }) {
 // Dashed CUT lines: they run edge-to-edge across the whole sheet, aligned to the
 // Design-Area (trim) edges, so the press knows exactly where to cut. The final
 // pages are the Design squares; everything outside is bleed that gets trimmed.
-function CutLines() {
+// `print` mode uses solid dark dashes (visible on paper) and drops the label.
+function CutLines({ print = false }) {
   // Trim edges as % of the Page Area, taken straight from the design rects.
-  const ys = [DESIGN_LEFT_RECT.topPct, DESIGN_LEFT_RECT.topPct + DESIGN_LEFT_RECT.heightPct];
+  const designTop = DESIGN_LEFT_RECT.topPct;
+  const designBottom = DESIGN_LEFT_RECT.topPct + DESIGN_LEFT_RECT.heightPct;
+  const ys = [designTop, designBottom];
+  // Only the two OUTER vertical cuts run the full height.
   const xs = [
     DESIGN_LEFT_RECT.leftPct,
-    DESIGN_LEFT_RECT.leftPct + DESIGN_LEFT_RECT.widthPct,
-    DESIGN_RIGHT_RECT.leftPct,
     DESIGN_RIGHT_RECT.leftPct + DESIGN_RIGHT_RECT.widthPct,
   ];
+  // The two INNER edges (the center gutter / fold) are marked ONLY in the white
+  // margins above and below the pages — never across the artwork.
+  const innerXs = [
+    DESIGN_LEFT_RECT.leftPct + DESIGN_LEFT_RECT.widthPct,
+    DESIGN_RIGHT_RECT.leftPct,
+  ];
+  const stroke = print ? "rgba(0,0,0,0.85)" : "rgba(255,255,255,0.95)";
+  const glow = print ? undefined : "drop-shadow(0 0 1px rgba(0,0,0,0.9))";
   return (
     <div className="pointer-events-none absolute inset-0 z-[6100]" aria-hidden>
       {ys.map((y, i) => (
         <div
           key={`h${i}`}
           className="absolute left-0 right-0"
-          style={{
-            top: `${y}%`,
-            height: 0,
-            borderTop: "1px dashed rgba(255,255,255,0.95)",
-            filter: "drop-shadow(0 0 1px rgba(0,0,0,0.9))",
-          }}
+          style={{ top: `${y}%`, height: 0, borderTop: `1px dashed ${stroke}`, filter: glow }}
         />
       ))}
       {xs.map((x, i) => (
         <div
           key={`v${i}`}
           className="absolute top-0 bottom-0"
-          style={{
-            left: `${x}%`,
-            width: 0,
-            borderLeft: "1px dashed rgba(255,255,255,0.95)",
-            filter: "drop-shadow(0 0 1px rgba(0,0,0,0.9))",
-          }}
+          style={{ left: `${x}%`, width: 0, borderLeft: `1px dashed ${stroke}`, filter: glow }}
         />
       ))}
-      <span className="absolute right-1 top-1 rounded bg-black/70 px-1 text-[9px] font-semibold text-white">
-        ✂ Cut lines
-      </span>
+      {innerXs.map((x, i) => (
+        <div key={`c${i}`}>
+          {/* top margin segment */}
+          <div
+            className="absolute"
+            style={{ left: `${x}%`, top: 0, height: `${designTop}%`, width: 0, borderLeft: `1px dashed ${stroke}`, filter: glow }}
+          />
+          {/* bottom margin segment */}
+          <div
+            className="absolute"
+            style={{ left: `${x}%`, top: `${designBottom}%`, height: `${100 - designBottom}%`, width: 0, borderLeft: `1px dashed ${stroke}`, filter: glow }}
+          />
+        </div>
+      ))}
+      {!print && (
+        <span className="absolute right-1 top-1 rounded bg-black/70 px-1 text-[9px] font-semibold text-white">
+          ✂ Cut lines
+        </span>
+      )}
     </div>
   );
 }
@@ -6159,34 +6193,80 @@ function SideLayer({ side, printRect, designRect, resolve, aiResultUrl }) {
 
 // Read-only render of a full sheet: the Page Area with both independent sides
 // (left + right) composited at the press's exact geometry.
-function SheetCanvas({ cell, resolve, results, spreadGuide = false, className = "", mirror = false }) {
+function SheetCanvas({ cell, resolve, results, spreadGuide = false, cutLines = false, className = "" }) {
   const sides = getSides(cell);
-  // In an RTL (Arabic) book the sheet is mirrored: the RIGHT side (front cover /
-  // odd page) is composited into the LEFT print-half and vice versa. The data
-  // model is unchanged — only the physical placement flips.
-  const leftKey = mirror ? "right" : "left";
-  const rightKey = mirror ? "left" : "right";
   return (
     <div
       className={`relative isolate overflow-hidden bg-white ${className}`}
       style={{ aspectRatio: PAGE_AREA_RATIO_CSS, containerType: "size" }}
     >
       <SideLayer
-        side={sides[leftKey]}
+        side={sides.left}
         printRect={PRINT_LEFT_RECT}
         designRect={DESIGN_LEFT_RECT}
         resolve={resolve}
-        aiResultUrl={results?.[`${cell.id}:${leftKey}`]?.url}
+        aiResultUrl={results?.[`${cell.id}:left`]?.url}
       />
       <SideLayer
-        side={sides[rightKey]}
+        side={sides.right}
         printRect={PRINT_RIGHT_RECT}
         designRect={DESIGN_RIGHT_RECT}
         resolve={resolve}
-        aiResultUrl={results?.[`${cell.id}:${rightKey}`]?.url}
+        aiResultUrl={results?.[`${cell.id}:right`]?.url}
       />
       {spreadGuide && <PrintSpecGuides />}
+      {cutLines && <CutLines print />}
     </div>
+  );
+}
+
+// Export the book to PDF: one A3 landscape page per sheet. Rendered into a
+// body-level portal so the print stylesheet (index.css) can hide the app and
+// print only these sheets. Set `cells` to trigger a print; `onDone` clears it.
+function BookPrint({ cells, resolve, onDone }) {
+  const ref = useRef(null);
+  const doneRef = useRef(onDone);
+  doneRef.current = onDone;
+
+  useEffect(() => {
+    if (!cells || !cells.length) return;
+    let finished = false;
+    const finish = () => {
+      if (finished) return;
+      finished = true;
+      window.removeEventListener("afterprint", finish);
+      doneRef.current?.();
+    };
+    const node = ref.current;
+    const imgs = node ? Array.from(node.querySelectorAll("img")) : [];
+    const waitImg = (im) =>
+      im.complete
+        ? Promise.resolve()
+        : new Promise((r) => {
+            im.onload = r;
+            im.onerror = r;
+          });
+    Promise.all(imgs.map(waitImg)).then(() => {
+      // Give the browser a beat to lay out fonts and container-query sizes.
+      setTimeout(() => {
+        window.addEventListener("afterprint", finish);
+        window.print();
+        // Safety net if afterprint never fires (varies by browser).
+        setTimeout(finish, 1500);
+      }, 250);
+    });
+  }, [cells]);
+
+  if (!cells || !cells.length) return null;
+  return createPortal(
+    <div id="book-print-root" ref={ref} aria-hidden>
+      {cells.map((cell) => (
+        <div className="book-print-page" key={cell.id}>
+          <SheetCanvas cell={cell} resolve={resolve} cutLines className="book-print-sheet" />
+        </div>
+      ))}
+    </div>,
+    document.body
   );
 }
 
@@ -8334,11 +8414,13 @@ function AlignPanel({ count, onAlign, onDelete }) {
 function Cell({
   cell,
   ratio,
-  leftLabel,
-  rightLabel,
-  mirror = false,
+  label,
   variables,
   busy,
+  canMoveUp,
+  canMoveDown,
+  onMoveUp,
+  onMoveDown,
   isDragging,
   isOver,
   onDragStart,
@@ -8373,10 +8455,15 @@ function Cell({
       onDrop={onDrop}
       className={`${frame} bg-white cursor-grab active:cursor-grabbing`}
     >
-      {/* Full sheet: both independent sides composited at the print geometry.
-          In an RTL (Arabic) book the sheet is mirrored so the front cover / odd
-          pages sit on the LEFT (front cover | back cover, page 3 | page 2). */}
-      <SheetCanvas cell={cell} className="w-full" spreadGuide mirror={mirror} />
+      {/* Full sheet: both independent sides composited at the print geometry. */}
+      <SheetCanvas cell={cell} className="w-full" spreadGuide />
+
+      {/* One label for the whole sheet (page). */}
+      {label && (
+        <span className="absolute left-1 top-1 z-[6001] rounded bg-black/60 px-1.5 py-0.5 text-[10px] font-medium text-white">
+          {label}
+        </span>
+      )}
 
       {isEmpty && (
         <div className="absolute inset-0 z-[6002] flex flex-col items-center justify-center gap-2 text-zinc-600">
@@ -8398,15 +8485,6 @@ function Cell({
           <Spinner />
         </div>
       )}
-
-      {/* Half labels: the press prints two pages per sheet (left + right). In an
-          RTL book the halves are mirrored, so the labels swap sides too. */}
-      <span className="absolute left-1 top-1 z-[6001] rounded bg-black/60 px-1.5 py-0.5 text-[10px] font-medium text-white">
-        {mirror ? rightLabel : leftLabel}
-      </span>
-      <span className="absolute left-1/2 top-1 z-[6001] ml-1 rounded bg-black/60 px-1.5 py-0.5 text-[10px] font-medium text-white">
-        {mirror ? leftLabel : rightLabel}
-      </span>
 
       {/* Identity-scoring level (set by Analyze, manually overridable) */}
       {onSetCellScoring && (
@@ -8435,6 +8513,26 @@ function Cell({
 
       {/* Controls */}
       <div className="absolute right-1 top-1 z-[6002] flex gap-1 opacity-0 transition group-hover:opacity-100">
+        {onMoveUp && (
+          <button
+            onClick={onMoveUp}
+            disabled={!canMoveUp}
+            title="Move page up"
+            className="flex h-6 w-6 items-center justify-center rounded bg-black/70 text-[11px] font-medium text-white hover:bg-black disabled:cursor-not-allowed disabled:opacity-30"
+          >
+            ↑
+          </button>
+        )}
+        {onMoveDown && (
+          <button
+            onClick={onMoveDown}
+            disabled={!canMoveDown}
+            title="Move page down"
+            className="flex h-6 w-6 items-center justify-center rounded bg-black/70 text-[11px] font-medium text-white hover:bg-black disabled:cursor-not-allowed disabled:opacity-30"
+          >
+            ↓
+          </button>
+        )}
         {!isEmpty && (
           <button
             onClick={() => onOpenEditor(cell.id)}

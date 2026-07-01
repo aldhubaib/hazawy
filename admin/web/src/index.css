@@ -22,3 +22,64 @@ body {
   color: #e7e9ee;
   font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
 }
+
+/* ----------------------------- PDF export -------------------------------- */
+/* The book is exported by printing to PDF: each sheet fills one A3 landscape
+   page (scaled to fit — the design keeps its Page-Area aspect). The print root
+   is portaled to <body> so it can be shown while the app (#root) is hidden. */
+#book-print-root {
+  display: none;
+}
+
+@media print {
+  @page {
+    size: A3 landscape;
+    margin: 0;
+  }
+
+  html,
+  body {
+    height: auto;
+    background: #fff;
+  }
+
+  /* Hide the live app; show only the print root. */
+  #root {
+    display: none !important;
+  }
+
+  #book-print-root {
+    display: block !important;
+  }
+
+  /* Force background colors/images to actually print (browsers strip them by
+     default — this is why a color background looked missing while <img>
+     backgrounds still showed). */
+  #book-print-root,
+  #book-print-root * {
+    -webkit-print-color-adjust: exact !important;
+    print-color-adjust: exact !important;
+  }
+
+  .book-print-page {
+    width: 420mm;
+    height: 297mm;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    overflow: hidden;
+    background: #fff;
+    page-break-after: always;
+    break-after: page;
+  }
+
+  .book-print-page:last-child {
+    page-break-after: auto;
+    break-after: auto;
+  }
+
+  .book-print-sheet {
+    width: 420mm;
+    height: 297mm;
+  }
+}
