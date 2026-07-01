@@ -68,8 +68,34 @@ export const api = {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(patch),
     }).then(json),
+
+  // --- Countries (markets) ----------------------------------------------------
+  listCountries: (all = false) => authFetch(`/api/countries${all ? "?all=1" : ""}`).then(json),
+  createCountry: (country) =>
+    authFetch("/api/countries", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(country),
+    }).then(json),
+  updateCountry: (code, patch) =>
+    authFetch(`/api/countries/${encodeURIComponent(code)}`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(patch),
+    }).then(json),
+  deleteCountry: (code) =>
+    authFetch(`/api/countries/${encodeURIComponent(code)}`, { method: "DELETE" }).then(json),
   deleteAccessUser: (email) =>
     authFetch(`/api/access/users/${encodeURIComponent(email)}`, { method: "DELETE" }).then(json),
+  // --- History / audit log ----------------------------------------------------
+  listHistory: (params = {}) => {
+    const clean = Object.fromEntries(
+      Object.entries(params).filter(([, v]) => v !== undefined && v !== null && v !== "")
+    );
+    const qs = new URLSearchParams(clean).toString();
+    return authFetch(`/api/history${qs ? `?${qs}` : ""}`).then(json);
+  },
+
   getSettings: () => authFetch("/api/settings").then(json),
   saveSettings: (patch) =>
     authFetch("/api/settings", {
@@ -172,6 +198,22 @@ export const api = {
     return authFetch("/api/media", { method: "POST", body: fd }).then(json);
   },
 
+  // --- Customers --------------------------------------------------------------
+  listCustomers: () => authFetch("/api/customers").then(json),
+  createCustomer: (name, phone, country) =>
+    authFetch("/api/customers", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name, phone, country }),
+    }).then(json),
+  updateCustomer: (id, patch) =>
+    authFetch(`/api/customers/${id}`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(patch),
+    }).then(json),
+  deleteCustomer: (id) => authFetch(`/api/customers/${id}`, { method: "DELETE" }).then(json),
+
   // --- Variables --------------------------------------------------------------
   listVariables: () => authFetch("/api/variables").then(json),
   createVariable: (name, opts = {}) =>
@@ -229,6 +271,13 @@ export const api = {
       body: JSON.stringify({ gender }),
     }).then(json),
 
+  updateStoryCharacters: (id, characters) =>
+    authFetch(`/api/stories/${id}/characters`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ characters }),
+    }).then(json),
+
   updateStoryTitle: (id, titles) =>
     authFetch(`/api/stories/${id}/title`, {
       method: "PUT",
@@ -256,8 +305,18 @@ export const api = {
   unpublishStory: (id) =>
     authFetch(`/api/stories/${id}/unpublish`, { method: "POST" }).then(json),
 
+  // --- Pricing ----------------------------------------------------------------
+  listPricing: () => authFetch("/api/pricing").then(json),
+  updatePricing: (id, { country, price, discountPrice }) =>
+    authFetch(`/api/pricing/${id}`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ country, price, discountPrice }),
+    }).then(json),
+
   // --- Orders -----------------------------------------------------------------
-  listOrders: () => authFetch("/api/orders").then(json),
+  listOrders: (country = "all") =>
+    authFetch(`/api/orders?country=${encodeURIComponent(country || "all")}`).then(json),
   getOrder: (id) => authFetch(`/api/orders/${id}`).then(json),
   createOrder: (title, storyId, opts = {}) =>
     authFetch("/api/orders", {
@@ -267,15 +326,34 @@ export const api = {
     }).then(json),
   deleteOrder: (id) => authFetch(`/api/orders/${id}`, { method: "DELETE" }).then(json),
 
-  uploadOrderKid: (id, file) => {
+  // `characterId` scopes the photo to a cast member; omitted = primary character.
+  uploadOrderKid: (id, file, characterId) => {
     const fd = new FormData();
     fd.append("kid", file);
-    return authFetch(`/api/orders/${id}/kid`, { method: "POST", body: fd }).then(json);
+    const url = characterId
+      ? `/api/orders/${id}/characters/${characterId}/kid`
+      : `/api/orders/${id}/kid`;
+    return authFetch(url, { method: "POST", body: fd }).then(json);
   },
-  restoreOrderKid: (id) =>
-    authFetch(`/api/orders/${id}/kid/restore`, { method: "POST" }).then(json),
-  anchorOrderKid: (id) =>
-    authFetch(`/api/orders/${id}/kid/anchor`, { method: "POST" }).then(json),
+  restoreOrderKid: (id, characterId) =>
+    authFetch(
+      characterId ? `/api/orders/${id}/characters/${characterId}/kid/restore` : `/api/orders/${id}/kid/restore`,
+      { method: "POST" }
+    ).then(json),
+  anchorOrderKid: (id, characterId) =>
+    authFetch(
+      characterId ? `/api/orders/${id}/characters/${characterId}/kid/anchor` : `/api/orders/${id}/kid/anchor`,
+      { method: "POST" }
+    ).then(json),
+  setOrderKidName: (id, characterId, { name, nameAr }) =>
+    authFetch(
+      characterId ? `/api/orders/${id}/characters/${characterId}/kid/name` : `/api/orders/${id}/kid/name`,
+      {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name, nameAr }),
+      }
+    ).then(json),
   generateOrder: (id, sceneId, prompt, opts = {}) =>
     authFetch(`/api/orders/${id}/generate`, {
       method: "POST",

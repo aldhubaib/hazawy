@@ -14,10 +14,16 @@
 
 export const MODULES = {
   stories: { label: "Stories", icon: "📖", assignable: true },
+  pricing: { label: "Pricing", icon: "💵", assignable: true },
   orders: { label: "Orders", icon: "🧾", assignable: true },
-  variables: { label: "Variables", icon: "🔤", assignable: true },
+  customers: { label: "Customers", icon: "👤", assignable: true },
+  // Variables + Access live inside the Settings page now, so they're hidden from
+  // the sidebar (hideFromNav) but keep their own module ids for route gating.
+  variables: { label: "Variables", icon: "🔤", assignable: true, hideFromNav: true },
   settings: { label: "Settings", icon: "⚙️", adminOnly: true },
-  access: { label: "Access", icon: "👥", adminOnly: true },
+  access: { label: "Access", icon: "👥", adminOnly: true, hideFromNav: true },
+  // Audit/history log — admin-only, surfaced as a tab inside Settings.
+  history: { label: "History", icon: "🕘", adminOnly: true, hideFromNav: true },
 };
 
 // Declared order is the order the sidebar renders in.

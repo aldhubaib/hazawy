@@ -79,6 +79,20 @@ export async function uploadToFal(absPath) {
   return fal.storage.upload(file);
 }
 
+/** Upload an in-memory image buffer (e.g. a sharp crop/composite) to fal. */
+export async function uploadBufferToFal(buffer, fileName = "image.png", type = "image/png") {
+  ensureConfigured();
+  const file = new File([buffer], fileName, { type });
+  return fal.storage.upload(file);
+}
+
+/** Fetch a remote image into a Buffer (used by the composite generator). */
+export async function fetchImageBuffer(imageUrl) {
+  const res = await fetch(imageUrl);
+  if (!res.ok) throw new Error(`Failed to fetch image (${res.status})`);
+  return Buffer.from(await res.arrayBuffer());
+}
+
 /**
  * GPT-Image-2 EDIT via fal (openai/gpt-image-2/edit). Image-in, image-out: the
  * uploaded/restored child photo is the actual input, not just a text prompt.

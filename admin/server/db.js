@@ -10,7 +10,7 @@ const DATA_ROOT = process.env.DATA_ROOT || __dirname;
 const DATA_DIR = path.join(DATA_ROOT, "data");
 const DB_FILE = path.join(DATA_DIR, "stories.json");
 
-const EMPTY = { stories: {}, orders: {}, variables: {}, symbols: {}, access: { users: {} } };
+const EMPTY = { stories: {}, orders: {}, customers: {}, countries: {}, variables: {}, symbols: {}, access: { users: {} }, history: [] };
 
 // When DATABASE_URL is present (production / Railway Postgres) the whole app
 // state is stored as a single JSONB document. Otherwise we fall back to a local

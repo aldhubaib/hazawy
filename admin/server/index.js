@@ -10,7 +10,9 @@ dotenv.config({ path: path.join(__dirnameEnv, ".env") });
 
 import cors from "cors";
 import multer from "multer";
+import sharp from "sharp";
 import { nanoid } from "nanoid";
+import { parsePhoneNumberFromString } from "libphonenumber-js";
 
 import { readDb, writeDb } from "./db.js";
 import {
@@ -28,6 +30,8 @@ import {
   fluxPulid,
   padToSquareFal,
   downloadToUploads,
+  uploadBufferToFal,
+  fetchImageBuffer,
   setFalKey,
   testFalKey,
 } from "./fal.js";
@@ -38,6 +42,7 @@ import {
   validateKidPhoto,
   derivePhotoStatus,
 } from "./checker.js";
+import { describeChange, buildActionLabel } from "./audit.js";
 // Shared access model — the single source of truth for modules/roles/can(),
 // imported by the web client too (see web/src/shared/access.js).
 import {
@@ -52,6 +57,22 @@ import {
   can,
   visibleModules,
 } from "../web/src/shared/access.js";
+// Shared country (market) model — dynamic registry + pricing/tax math, imported
+// by the web client too (see web/src/shared/countries.js).
+import {
+  isIsoCountry,
+  normalizeTax,
+  defaultCountryRecord,
+  SEED_COUNTRY_CODES,
+  countryList,
+  enabledCountries,
+  getCountry,
+  sanitizeCountries,
+  allowedCountries,
+  canCountry,
+  computeOrderPricing,
+  effectivePrice,
+} from "../web/src/shared/countries.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 // DATA_ROOT lets a host (e.g. Railway volume) point persistent storage at a
@@ -292,10 +313,13 @@ const ADMIN_EMAILS = (process.env.ADMIN_EMAILS || "")
 // can() then decides access uniformly (admin-only vs granted-to-member).
 const ROUTE_MODULE = [
   [/^\/api\/stories(\/|$)/, "stories"],
+  [/^\/api\/pricing(\/|$)/, "pricing"],
   [/^\/api\/orders(\/|$)/, "orders"],
+  [/^\/api\/customers(\/|$)/, "customers"],
   [/^\/api\/variables(\/|$)/, "variables"],
   [/^\/api\/settings(\/|$)/, "settings"],
   [/^\/api\/access(\/|$)/, "access"],
+  [/^\/api\/history(\/|$)/, "history"],
 ];
 
 // Endpoints any signed-in user may hit regardless of module grants.
@@ -384,8 +408,18 @@ async function resolveUser(req) {
     role,
     modules: role === "admin" ? ASSIGNABLE_MODULES.slice() : sanitizeModules(record?.modules),
   };
+  // Country grants: admins implicitly get every enabled country; members get the
+  // effective list (their assigned countries, or all when none are set yet).
+  const countriesRef = { ...user, isAdmin: role === "admin", countries: sanitizeCountries(record?.countries, db.countries) };
+  const effectiveCountries = allowedCountries(countriesRef, db.countries);
   // visibleModules() expands admins to admin-only modules too, via can().
-  return { ...user, isAdmin: role === "admin", modules: visibleModules(user), exists: Boolean(record) };
+  return {
+    ...user,
+    isAdmin: role === "admin",
+    modules: visibleModules(user),
+    countries: effectiveCountries,
+    exists: Boolean(record),
+  };
 }
 
 // Gate /api routes by the module they belong to, using the shared can(). Skips
@@ -492,6 +526,90 @@ app.use((req, res, next) => {
       });
     });
   }
+  next();
+});
+
+// ---------------------------------------------------------------------------
+// History / audit log
+// ---------------------------------------------------------------------------
+// Every successful mutating request is recorded as a single history entry so
+// admins can see who changed what, and drill into the full timeline of any one
+// item. The rules that turn a request into a label live in ./audit.js; here we
+// just capture context (actor, created id, before-name for deletes) and append.
+const HISTORY_MAX = 3000;
+
+// A short, friendly name for an entity so the log reads "Story · My Book"
+// rather than just an opaque id.
+function entityName(db, entity, id) {
+  if (!id) return null;
+  if (entity === "story") return db.stories?.[id]?.title || null;
+  if (entity === "order") return db.orders?.[id]?.title || null;
+  if (entity === "customer") return db.customers?.[id]?.name || null;
+  if (entity === "country") return db.countries?.[id]?.name || id;
+  if (entity === "variable") return db.variables?.[id]?.name || null;
+  if (entity === "access") return id; // the email is the name
+  return null;
+}
+
+async function recordHistory(req, res, desc) {
+  // Prefer the response payload (covers create/edit, which return the entity),
+  // then fall back to the name snapshotted before a delete.
+  const body = res._auditBody && typeof res._auditBody === "object" ? res._auditBody : {};
+  const entityId = desc.entityId || body.id || null;
+  const target = entityId ? `${desc.entity}:${entityId}` : desc.entity;
+  const name = body.title || body.name || req._auditBeforeName || null;
+
+  const entry = {
+    id: nanoid(10),
+    at: Date.now(),
+    actor: req.me?.email || "local",
+    entity: desc.entity,
+    entityId,
+    target,
+    name,
+    action: buildActionLabel(desc, req),
+    method: req.method,
+    path: req.path,
+  };
+
+  const db = await readDb();
+  if (!Array.isArray(db.history)) db.history = [];
+  db.history.unshift(entry);
+  if (db.history.length > HISTORY_MAX) db.history.length = HISTORY_MAX;
+  await writeDb(db);
+}
+
+app.use(async (req, res, next) => {
+  let desc = null;
+  try {
+    desc = describeChange(req);
+  } catch {
+    desc = null;
+  }
+  if (!desc) return next();
+
+  // Capture whatever the handler sends back, so we can learn a created entity's
+  // id/title for accurate grouping and labels.
+  const origJson = res.json.bind(res);
+  res.json = (payload) => {
+    res._auditBody = payload;
+    return origJson(payload);
+  };
+
+  // A delete removes the entity, so grab its name now while it still exists.
+  if (req.method === "DELETE" && desc.entityId) {
+    try {
+      const db = await readDb();
+      req._auditBeforeName = entityName(db, desc.entity, desc.entityId);
+    } catch {
+      /* best-effort */
+    }
+  }
+
+  res.on("finish", () => {
+    if (res.statusCode >= 400) return;
+    recordHistory(req, res, desc).catch((err) => console.error("[history]", err.message));
+  });
   next();
 });
 
@@ -676,6 +794,8 @@ function publicUser(record) {
     email: record.email,
     role,
     modules: role === "admin" ? ASSIGNABLE_MODULES.slice() : sanitizeModules(record.modules ?? record.pages),
+    // Member country grants (admins are implicitly all, so we leave it empty).
+    countries: role === "admin" ? [] : Array.isArray(record.countries) ? record.countries : [],
     invitedAt: record.invitedAt || 0,
   };
 }
@@ -686,11 +806,20 @@ app.get(
   "/api/access/me",
   asyncHandler(async (req, res) => {
     if (!AUTH_ENABLED) {
+      const db = await readDb();
+      const codes = enabledCountries(db.countries).map((c) => c.code);
       const user = { email: "", role: "admin", modules: ASSIGNABLE_MODULES.slice() };
-      return res.json({ ...ACCESS_META, ...user, isAdmin: true, modules: visibleModules(user) });
+      return res.json({ ...ACCESS_META, ...user, isAdmin: true, modules: visibleModules(user), countries: codes });
     }
     const me = req.me;
-    res.json({ ...ACCESS_META, email: me.email, role: me.role, isAdmin: me.isAdmin, modules: me.modules });
+    res.json({
+      ...ACCESS_META,
+      email: me.email,
+      role: me.role,
+      isAdmin: me.isAdmin,
+      modules: me.modules,
+      countries: me.countries,
+    });
   })
 );
 
@@ -722,7 +851,9 @@ app.post(
     if (db.access.users[email]) {
       return res.status(409).json({ error: "That person already has access." });
     }
-    db.access.users[email] = { email, role, modules, invitedAt: Date.now() };
+    // Members can be scoped to specific countries; admins are implicitly all.
+    const countries = role === "admin" ? [] : sanitizeCountries(req.body?.countries, db.countries);
+    db.access.users[email] = { email, role, modules, countries, invitedAt: Date.now() };
     await writeDb(db);
     res.json({ ok: true, user: publicUser(db.access.users[email]) });
   })
@@ -747,6 +878,12 @@ app.put(
     else if (Array.isArray(incomingModules)) record.modules = sanitizeModules(incomingModules);
     delete record.pages; // drop the legacy field once touched
 
+    // Country grants follow the same rule: admins are all (cleared), members keep
+    // their explicit list.
+    if (record.role === "admin") record.countries = [];
+    else if (Array.isArray(req.body?.countries))
+      record.countries = sanitizeCountries(req.body.countries, db.countries);
+
     await writeDb(db);
     res.json({ ok: true, user: publicUser(record) });
   })
@@ -768,6 +905,23 @@ app.delete(
   })
 );
 
+// --- History / audit log ------------------------------------------------------
+// Admin-only (gated by the "history" module). Supports optional filtering by
+// `target` (for an item's related timeline), `entity`, or `actor`.
+app.get(
+  "/api/history",
+  asyncHandler(async (req, res) => {
+    const db = await readDb();
+    let entries = Array.isArray(db.history) ? db.history : [];
+    const { target, entity, actor } = req.query;
+    if (target) entries = entries.filter((e) => e.target === target);
+    if (entity) entries = entries.filter((e) => e.entity === entity);
+    if (actor) entries = entries.filter((e) => e.actor === actor);
+    const limit = Math.min(Math.max(Number(req.query.limit) || 1000, 1), HISTORY_MAX);
+    res.json({ authEnabled: AUTH_ENABLED, entries: entries.slice(0, limit) });
+  })
+);
+
 // --- Stories ------------------------------------------------------------------
 app.get(
   "/api/stories",
@@ -783,6 +937,11 @@ app.get(
     const db = await readDb();
     const story = db.stories[req.params.id];
     if (!story) return res.status(404).json({ error: "Story not found" });
+    // Lazily migrate legacy stories to the cast model before returning.
+    if (!Array.isArray(story.characters) || story.characters.length === 0) {
+      ensureCharacters(story);
+      await writeDb(db);
+    }
     res.json(story);
   })
 );
@@ -817,6 +976,11 @@ app.post(
       // Calibration children used to validate the story before publishing.
       testKidIds: [],
       results: {},
+      // Cast: the children this story features. Single-character by default; a
+      // multi-kid story adds more and pins them to face slots per scene.
+      characters: [
+        { id: nanoid(8), key: "child", label: "Child", gender: gender || "female" },
+      ],
     };
     await writeDb(db);
     res.status(201).json(db.stories[id]);
@@ -997,7 +1161,7 @@ app.put(
     if (!story) return res.status(404).json({ error: "Story not found" });
     const cell = story.scenes.find((s) => s.id === req.params.cellId);
     if (!cell) return res.status(404).json({ error: "Cell not found" });
-    const { text, size, type, style, elements, bgUrl, bgFalUrl, bgColor, safeZones, identityScoring, identityScoringManual, identityNote, genChoice, correction, aiPrompt } = req.body || {};
+    const { text, size, type, style, elements, bgUrl, bgFalUrl, bgColor, safeZones, kidSlots, sides, identityScoring, identityScoringManual, identityNote, genChoice, correction, aiPrompt } = req.body || {};
     if (["strict", "advisory", "none"].includes(identityScoring)) cell.identityScoring = identityScoring;
     if (typeof identityScoringManual === "boolean") cell.identityScoringManual = identityScoringManual;
     if (typeof identityNote === "string") cell.identityNote = identityNote;
@@ -1013,6 +1177,10 @@ app.put(
     if (style && typeof style === "object") cell.style = { ...(cell.style || {}), ...style };
     if (Array.isArray(elements)) cell.elements = elements;
     if (Array.isArray(safeZones)) cell.safeZones = safeZones;
+    if (Array.isArray(kidSlots)) cell.kidSlots = kidSlots;
+    // Per-side design ({ left, right }): each side is an independent page the
+    // press prints together on one sheet.
+    if (sides && typeof sides === "object") cell.sides = sides;
     if (bgUrl !== undefined) cell.bgUrl = bgUrl;
     if (bgFalUrl !== undefined) cell.bgFalUrl = bgFalUrl;
     if (typeof bgColor === "string") cell.bgColor = bgColor;
@@ -1028,6 +1196,8 @@ app.put(
       (style && typeof style === "object") ||
       Array.isArray(elements) ||
       Array.isArray(safeZones) ||
+      Array.isArray(kidSlots) ||
+      (sides && typeof sides === "object") ||
       bgUrl !== undefined ||
       bgFalUrl !== undefined ||
       typeof bgColor === "string" ||
@@ -1142,20 +1312,26 @@ app.delete(
 );
 
 // Generic media upload for editor elements (images dropped onto a page).
-// Returns the local url plus a fal url; does not mutate any cell.
+// Returns the local url immediately. The fal upload is a slow remote round-trip
+// and is NOT needed just to place a decorative image on the canvas — it's only
+// required when the image becomes an AI generation base, which is uploaded to
+// fal lazily on demand (see aiBaseFalUrl). Pass ?fal=1 to force it inline.
 app.post(
   "/api/media",
   upload.single("image"),
   asyncHandler(async (req, res) => {
     if (!req.file) return res.status(400).json({ error: "No image uploaded" });
     const url = `/uploads/${req.file.filename}`;
-    let falUrl = null;
-    try {
-      falUrl = await uploadToFal(path.join(UPLOAD_DIR, req.file.filename));
-    } catch (e) {
-      console.warn("media upload to fal failed:", e.message);
+    if (req.query.fal === "1") {
+      let falUrl = null;
+      try {
+        falUrl = await uploadToFal(path.join(UPLOAD_DIR, req.file.filename));
+      } catch (e) {
+        console.warn("media upload to fal failed:", e.message);
+      }
+      return res.status(201).json({ url, falUrl });
     }
-    res.status(201).json({ url, falUrl });
+    res.status(201).json({ url, falUrl: null });
   })
 );
 
@@ -1824,6 +2000,166 @@ async function runGenerate({
   };
 }
 
+// Convert a kid-slot box (drawn in cell-canvas coordinates) into the AI base
+// image's own coordinate space. The AI base element occupies a sub-rectangle of
+// the cell; the generated image fills exactly that rectangle. Legacy full-bleed
+// scenes (no AI element) map identically (the image is the whole cell).
+function slotToAiSpace(slot, scene) {
+  const ai = aiBaseElement(scene);
+  if (!ai) return { xPct: slot.xPct, yPct: slot.yPct, wPct: slot.wPct, hPct: slot.hPct };
+  const aw = ai.wPct || 100;
+  const ah = ai.hPct || 100;
+  return {
+    xPct: ((slot.xPct - (ai.xPct || 0)) / aw) * 100,
+    yPct: ((slot.yPct - (ai.yPct || 0)) / ah) * 100,
+    wPct: (slot.wPct / aw) * 100,
+    hPct: (slot.hPct / ah) * 100,
+  };
+}
+
+// Build an RGBA buffer of `swapped` resized to w×h with feathered edges, so it
+// composites onto the base without a hard rectangular seam. Falls back to a hard
+// edge if any sharp channel op fails (composite must always succeed).
+async function featherCrop(swappedBuf, w, h) {
+  const rgb = await sharp(swappedBuf).resize(w, h, { fit: "fill" }).removeAlpha().png().toBuffer();
+  try {
+    const inset = Math.max(1, Math.round(Math.min(w, h) * 0.08));
+    // Single-channel alpha mask: opaque interior, transparent border. Built as a
+    // raw 1-channel buffer (sharp's create() only allows 3–4 channels), then
+    // blurred to soften the edge before joining as the alpha channel.
+    const maskRaw = Buffer.alloc(w * h, 0);
+    for (let yy = inset; yy < h - inset; yy++) {
+      const row = yy * w;
+      for (let xx = inset; xx < w - inset; xx++) maskRaw[row + xx] = 255;
+    }
+    const mask = await sharp(maskRaw, { raw: { width: w, height: h, channels: 1 } })
+      .blur(Math.max(0.5, inset / 2))
+      .png()
+      .toBuffer();
+    return await sharp(rgb).joinChannel(mask).png().toBuffer();
+  } catch (e) {
+    console.warn("feather failed, using hard edge:", e.message);
+    return sharp(rgb).ensureAlpha().png().toBuffer();
+  }
+}
+
+// Composite-per-face generation. For each kid slot: crop the slot box from the
+// base image, run the existing single-face swap on just that crop, then paste the
+// swapped face back. Handles any number of children deterministically (each child
+// lands exactly where its slot is). Returns the same result shape as runGenerate.
+async function runSlotComposite({ scene, baseFalUrl, slots, kidsByCharacter, charactersById, scoring }) {
+  const baseBuf = await fetchImageBuffer(baseFalUrl);
+  const meta = await sharp(baseBuf).metadata();
+  const W = meta.width || 0;
+  const H = meta.height || 0;
+  if (!W || !H) throw new Error("Could not read base image dimensions for composite.");
+
+  const overlays = [];
+  const perFace = [];
+
+  for (const slot of slots) {
+    const kid = kidsByCharacter[slot.characterId];
+    const character = charactersById[slot.characterId] || {};
+    if (!kid) {
+      perFace.push({ characterId: slot.characterId, label: character.label, error: "no photo" });
+      continue;
+    }
+    const box = slotToAiSpace(slot, scene);
+    // Pixel rect with a small padding margin, clamped to the image bounds.
+    const padX = (box.wPct / 100) * W * 0.12;
+    const padY = (box.hPct / 100) * H * 0.12;
+    const x = Math.max(0, Math.round((box.xPct / 100) * W - padX));
+    const y = Math.max(0, Math.round((box.yPct / 100) * H - padY));
+    const w = Math.min(W - x, Math.round((box.wPct / 100) * W + padX * 2));
+    const h = Math.min(H - y, Math.round((box.hPct / 100) * H + padY * 2));
+    if (w <= 2 || h <= 2) {
+      perFace.push({ characterId: slot.characterId, label: character.label, error: "slot too small" });
+      continue;
+    }
+
+    const cropBuf = await sharp(baseBuf).extract({ left: x, top: y, width: w, height: h }).png().toBuffer();
+    const cropUrl = await uploadBufferToFal(cropBuf, `crop-${slot.id}-${nanoid(6)}.png`);
+    const faceSrc = kid.restoredFalUrl || kid.rawFalUrl || kid.falUrl;
+    let swappedUrl;
+    try {
+      const swap = await advancedFaceSwap({
+        faceImageUrl: faceSrc,
+        targetImageUrl: cropUrl,
+        gender: character.gender || "female",
+        // Keep the template's hair (product decision); swap only the face.
+        workflowType: "target_hair",
+      });
+      swappedUrl = swap.url;
+    } catch (e) {
+      console.warn(`slot swap failed for ${character.label || slot.characterId}:`, e.message);
+      perFace.push({ characterId: slot.characterId, label: character.label, error: e.message });
+      continue; // leave the original crop in place
+    }
+
+    const swappedBuf = await fetchImageBuffer(swappedUrl);
+    const feathered = await featherCrop(swappedBuf, w, h);
+    overlays.push({ input: feathered, left: x, top: y });
+
+    // Per-face identity score against this child's faithful reference.
+    let faceCheck = null;
+    if (scoring !== "none" && isCheckerEnabled()) {
+      faceCheck = await checkConsistency({
+        referenceUrl: scoreReference(kid),
+        candidateUrl: swappedUrl,
+        candidateIsScene: false,
+      }).catch(() => null);
+    }
+    perFace.push({
+      characterId: slot.characterId,
+      label: character.label,
+      score: typeof faceCheck?.score === "number" ? faceCheck.score : null,
+      check: faceCheck,
+    });
+  }
+
+  const finalBuf = await sharp(baseBuf).composite(overlays).png().toBuffer();
+  const remoteUrl = await uploadBufferToFal(finalBuf, `composite-${scene.id}-${nanoid(6)}.png`);
+  const fileName = `result-composite-${scene.id}-${nanoid(6)}.png`;
+  let localUrl;
+  try {
+    localUrl = await downloadToUploads(remoteUrl, fileName);
+  } catch {
+    localUrl = remoteUrl;
+  }
+
+  // Aggregate score = the weakest face (a story page is only as good as its
+  // least-matching child). Drives the same auto-decision as single-kid pages.
+  const scored = perFace.filter((f) => typeof f.score === "number");
+  const minScore = scored.length ? Math.min(...scored.map((f) => f.score)) : null;
+  let check;
+  if (scoring === "none") {
+    check = { enabled: true, level: "none", score: null, same_child: null, mismatches: [] };
+  } else {
+    check = {
+      enabled: true,
+      level: scoring,
+      score: minScore,
+      same_child: minScore == null ? null : minScore >= DECISION_THRESHOLDS.minReviewScore,
+      mismatches: [],
+      perFace,
+    };
+  }
+  const decisionInfo = decidePage(check, scoring);
+
+  return {
+    url: localUrl,
+    remoteUrl,
+    description: `composite/${slots.length}-face`,
+    method: "composite",
+    perFace,
+    swapError: perFace.find((f) => f.error)?.error || null,
+    prompt: null,
+    check,
+    ...decisionInfo,
+    createdAt: Date.now(),
+  };
+}
+
 // Ensure a scene has a cached fal URL (uploads it once if needed). Persists to
 // the story it belongs to. Returns the falUrl.
 async function ensureSceneFalUrl(storyId, sceneId) {
@@ -1843,6 +2179,14 @@ async function ensureSceneFalUrl(storyId, sceneId) {
 function aiBaseElement(scene) {
   const els = Array.isArray(scene.elements) ? scene.elements : [];
   return els.find((e) => e.type === "image" && e.plane === "ai") || null;
+}
+
+// A stable identity for a page's AI base image. Language twins are deep clones of
+// the same page, so they share this key — letting an order generate each unique
+// image once and reuse the render for every page that shares the same base.
+function sceneBaseKey(scene) {
+  const ai = aiBaseElement(scene);
+  return (ai && (ai.falUrl || ai.url)) || scene.falUrl || scene.fileName || null;
 }
 
 // Default story-wide generation knobs.
@@ -1955,6 +2299,34 @@ function sceneIsAi(scene) {
 // so "published" always means "every AI page is currently approved".
 function markStoryDraft(story) {
   if (story && story.status === "published") story.status = "draft";
+}
+
+// Lazily migrate a story to the multi-character (cast) model. Legacy stories get
+// a single character seeded from the story's own gender, so existing single-child
+// stories behave exactly as before. Also keeps story.gender mirrored to the first
+// character so older single-child prompts/routes keep working. Mutates + returns.
+function ensureCharacters(story) {
+  if (!story) return story;
+  if (!Array.isArray(story.characters) || story.characters.length === 0) {
+    story.characters = [
+      { id: nanoid(8), key: "child", label: "Child", gender: story.gender || "female" },
+    ];
+  }
+  // story.gender is the back-compat mirror of the primary character.
+  story.gender = story.characters[0].gender || story.gender || "female";
+  return story;
+}
+
+// Find a cast character by id (after ensureCharacters has run).
+function getCharacter(story, characterId) {
+  return (story.characters || []).find((c) => c.id === characterId) || null;
+}
+
+// The id of the primary (first) character — the back-compat target for the old
+// single-kid order fields and unparameterized kid routes.
+function primaryCharacterId(story) {
+  ensureCharacters(story);
+  return story.characters[0].id;
 }
 
 // Resolve a fal URL for the scene's AI base. Prefers the AI-plane image element
@@ -2225,6 +2597,40 @@ app.put(
   })
 );
 
+// Update the story's cast (the children it features). Each character has a label
+// and gender; ids are stable (kept when present so scene slot bindings survive).
+// Changing the cast can change how pages generate, so it drops the story to draft.
+app.put(
+  "/api/stories/:id/characters",
+  asyncHandler(async (req, res) => {
+    const db = await readDb();
+    const story = db.stories[req.params.id];
+    if (!story) return res.status(404).json({ error: "Story not found" });
+
+    const incoming = Array.isArray(req.body?.characters) ? req.body.characters : null;
+    if (!incoming || incoming.length === 0)
+      return res.status(400).json({ error: "A story needs at least one character." });
+
+    const usedKeys = new Set();
+    const next = incoming.map((c, i) => {
+      const label = String(c?.label || "").trim() || `Child ${i + 1}`;
+      const gender = ["female", "male", "non-binary"].includes(c?.gender) ? c.gender : "female";
+      // Keep a stable, unique key (used by name variables); derive from label.
+      let key = String(c?.key || label).toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "") || `child${i + 1}`;
+      while (usedKeys.has(key)) key = `${key}_${i}`;
+      usedKeys.add(key);
+      return { id: c?.id && typeof c.id === "string" ? c.id : nanoid(8), key, label, gender };
+    });
+
+    story.characters = next;
+    // Mirror primary onto story.gender for back-compat.
+    story.gender = next[0].gender;
+    markStoryDraft(story);
+    await writeDb(db);
+    res.json(story);
+  })
+);
+
 // Update the story's child gender. This changes how pages generate, so it drops
 // the story back to draft.
 app.put(
@@ -2234,7 +2640,12 @@ app.put(
     const story = db.stories[req.params.id];
     if (!story) return res.status(404).json({ error: "Story not found" });
     const { gender } = req.body || {};
-    if (["female", "male", "non-binary"].includes(gender)) story.gender = gender;
+    if (["female", "male", "non-binary"].includes(gender)) {
+      story.gender = gender;
+      // Mirror onto the primary character so the cast stays consistent.
+      ensureCharacters(story);
+      story.characters[0].gender = gender;
+    }
     markStoryDraft(story);
     await writeDb(db);
     res.json(story);
@@ -2331,12 +2742,31 @@ app.delete(
 // values are supplied per order and substituted into the rendered book.
 const VAR_TOKEN = /\{\{\s*([A-Za-z0-9_]+)\s*\}\}/g;
 
-function applyVars(text, vars) {
+// Per-character name tokens, e.g. {{name:hero}} / {{nameAr:hero}} where the
+// suffix is a cast character's `key`. Distinct from the global VAR_TOKEN above.
+const NAME_TOKEN = /\{\{\s*(name|nameAr)\s*:\s*([A-Za-z0-9_]+)\s*\}\}/g;
+
+// `names` (optional) maps a character key -> { name, nameAr } captured at order
+// intake. `names.__primary__` is the first character, used so the legacy
+// {{Child_Name}} variable falls back to the primary child's intake name.
+function applyVars(text, vars, names) {
   if (!text) return text || "";
-  return text.replace(VAR_TOKEN, (m, key) => {
-    const v = vars?.[key];
+  let out = text;
+  if (names) {
+    out = out.replace(NAME_TOKEN, (m, kind, key) => {
+      const rec = names[key];
+      const v = rec && (kind === "nameAr" ? rec.nameAr : rec.name);
+      return v != null && String(v) !== "" ? String(v) : m;
+    });
+  }
+  out = out.replace(VAR_TOKEN, (m, key) => {
+    let v = vars?.[key];
+    if ((v == null || String(v) === "") && key === "Child_Name" && names?.__primary__) {
+      v = names.__primary__.name;
+    }
     return v != null && String(v) !== "" ? String(v) : m;
   });
+  return out;
 }
 
 app.get(
@@ -2378,6 +2808,185 @@ app.delete(
     if (!db.variables?.[req.params.id])
       return res.status(404).json({ error: "Variable not found" });
     delete db.variables[req.params.id];
+    await writeDb(db);
+    res.json({ ok: true });
+  })
+);
+
+// --- Customers --------------------------------------------------------------
+// A simple directory of people. A customer is { id, name, phone (E.164),
+// country (ISO), createdAt }. The phone is validated with libphonenumber-js so
+// each number matches its country's real length/format, and it is unique across
+// all customers (compared on the normalized E.164 value).
+
+// Validate + normalize a phone number. `country` is an ISO code (e.g. "SA") used
+// to interpret numbers typed without a leading "+". Returns either
+// { e164, country } or { error }.
+function normalizeCustomerPhone(raw, country) {
+  const input = String(raw || "").trim();
+  if (!input) return { error: "Phone number is required." };
+  let parsed;
+  try {
+    parsed = parsePhoneNumberFromString(input, country || undefined);
+  } catch {
+    parsed = null;
+  }
+  if (!parsed) return { error: "Enter a valid phone number with its country code." };
+  if (!parsed.isValid()) {
+    return { error: "That phone number isn't the right length for the selected country." };
+  }
+  return { e164: parsed.number, country: parsed.country || country || null };
+}
+
+app.get(
+  "/api/customers",
+  asyncHandler(async (_req, res) => {
+    const db = await readDb();
+    const list = Object.values(db.customers || {}).sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+    res.json(list);
+  })
+);
+
+app.post(
+  "/api/customers",
+  asyncHandler(async (req, res) => {
+    const { name, phone, country } = req.body || {};
+    const cleanName = String(name || "").trim();
+    if (!cleanName) return res.status(400).json({ error: "Customer name is required." });
+
+    const norm = normalizeCustomerPhone(phone, country);
+    if (norm.error) return res.status(400).json({ error: norm.error });
+
+    const db = await readDb();
+    db.customers ||= {};
+    if (Object.values(db.customers).some((c) => c.phone === norm.e164))
+      return res.status(400).json({ error: "A customer with that phone number already exists." });
+
+    const id = nanoid(8);
+    db.customers[id] = {
+      id,
+      name: cleanName,
+      phone: norm.e164,
+      country: norm.country,
+      createdAt: Date.now(),
+    };
+    await writeDb(db);
+    res.status(201).json(db.customers[id]);
+  })
+);
+
+app.put(
+  "/api/customers/:id",
+  asyncHandler(async (req, res) => {
+    const db = await readDb();
+    const customer = db.customers?.[req.params.id];
+    if (!customer) return res.status(404).json({ error: "Customer not found." });
+
+    const { name, phone, country } = req.body || {};
+    if (name !== undefined) {
+      const cleanName = String(name || "").trim();
+      if (!cleanName) return res.status(400).json({ error: "Customer name is required." });
+      customer.name = cleanName;
+    }
+    if (phone !== undefined) {
+      const norm = normalizeCustomerPhone(phone, country ?? customer.country);
+      if (norm.error) return res.status(400).json({ error: norm.error });
+      if (Object.values(db.customers).some((c) => c.id !== customer.id && c.phone === norm.e164))
+        return res.status(400).json({ error: "A customer with that phone number already exists." });
+      customer.phone = norm.e164;
+      customer.country = norm.country;
+    }
+    await writeDb(db);
+    res.json(customer);
+  })
+);
+
+app.delete(
+  "/api/customers/:id",
+  asyncHandler(async (req, res) => {
+    const db = await readDb();
+    if (!db.customers?.[req.params.id])
+      return res.status(404).json({ error: "Customer not found." });
+    delete db.customers[req.params.id];
+    await writeDb(db);
+    res.json({ ok: true });
+  })
+);
+
+// --- Countries (markets) ----------------------------------------------------
+// The dynamic registry of operating countries. Reading the (enabled) list is
+// open to any signed-in user so selectors/labels work; mutations are admin-only
+// (management lives in Settings). When auth is disabled the local user is admin.
+
+function isAdminReq(req) {
+  return !AUTH_ENABLED || Boolean(req.me?.isAdmin);
+}
+
+app.get(
+  "/api/countries",
+  asyncHandler(async (req, res) => {
+    const db = await readDb();
+    const all = countryList(db.countries);
+    // Admins (and the settings UI via ?all=1) get the full list incl. disabled.
+    res.json(isAdminReq(req) || req.query.all === "1" ? all : all.filter((c) => c.enabled));
+  })
+);
+
+app.post(
+  "/api/countries",
+  asyncHandler(async (req, res) => {
+    if (!isAdminReq(req)) return res.status(403).json({ error: "Admins only." });
+    const cc = String(req.body?.code || "").toUpperCase();
+    if (!isIsoCountry(cc)) return res.status(400).json({ error: "Unknown country code." });
+
+    const db = await readDb();
+    db.countries ||= {};
+    if (db.countries[cc]) return res.status(409).json({ error: "That country is already added." });
+
+    const overrides = { order: Object.keys(db.countries).length };
+    if (typeof req.body.enabled === "boolean") overrides.enabled = req.body.enabled;
+    if (req.body.name && String(req.body.name).trim()) overrides.name = String(req.body.name).trim();
+    if (req.body.currency && String(req.body.currency).trim())
+      overrides.currency = String(req.body.currency).trim().toUpperCase();
+    if (req.body.tax) overrides.tax = req.body.tax;
+
+    db.countries[cc] = defaultCountryRecord(cc, overrides);
+    await writeDb(db);
+    res.status(201).json(db.countries[cc]);
+  })
+);
+
+app.put(
+  "/api/countries/:code",
+  asyncHandler(async (req, res) => {
+    if (!isAdminReq(req)) return res.status(403).json({ error: "Admins only." });
+    const cc = String(req.params.code || "").toUpperCase();
+    const db = await readDb();
+    const c = db.countries?.[cc];
+    if (!c) return res.status(404).json({ error: "Country not found." });
+
+    const { name, currency, enabled, order, tax } = req.body || {};
+    if (name !== undefined) c.name = String(name || "").trim() || c.name;
+    if (currency !== undefined) c.currency = String(currency || "").trim().toUpperCase() || c.currency;
+    if (enabled !== undefined) c.enabled = Boolean(enabled);
+    if (order !== undefined && Number.isFinite(Number(order))) c.order = Number(order);
+    if (tax !== undefined) c.tax = normalizeTax(tax);
+
+    await writeDb(db);
+    res.json(c);
+  })
+);
+
+app.delete(
+  "/api/countries/:code",
+  asyncHandler(async (req, res) => {
+    if (!isAdminReq(req)) return res.status(403).json({ error: "Admins only." });
+    const cc = String(req.params.code || "").toUpperCase();
+    const db = await readDb();
+    if (!db.countries?.[cc]) return res.status(404).json({ error: "Country not found." });
+    // Historical orders keep their own price/country snapshot, so removing a
+    // country here only hides it from new pricing/selectors.
+    delete db.countries[cc];
     await writeDb(db);
     res.json({ ok: true });
   })
@@ -2527,34 +3136,182 @@ app.delete(
 // An order = one child (kid) processed against one story's scenes. Orders are
 // first-class and have their own pages, separate from story (scene) management.
 
-// Patch the order's kid (re-read to avoid clobbering concurrent writes).
-async function patchOrderKid(orderId, patch) {
+// Resolve which character a kid photo belongs to, defaulting to the story's
+// primary character (the back-compat target for legacy single-kid orders).
+function orderCharacterId(db, order, characterId) {
+  const story = db.stories[order.storyId];
+  if (!story) return characterId || null;
+  ensureCharacters(story);
+  if (characterId && getCharacter(story, characterId)) return characterId;
+  return story.characters[0].id;
+}
+
+// Read an order's kid for a character, falling back to the legacy order.kid for
+// the primary character (orders created before the cast model).
+function getOrderKid(db, order, characterId) {
+  const cid = orderCharacterId(db, order, characterId);
+  const story = db.stories[order.storyId];
+  const primId = story ? primaryCharacterId(story) : null;
+  const kid = order.kids?.[cid] || (cid === primId ? order.kid : null) || null;
+  return { cid, primId, kid };
+}
+
+// Patch a character's kid (re-read to avoid clobbering concurrent writes). The
+// primary character stays mirrored onto the legacy order.kid field.
+async function patchOrderKid(orderId, characterId, patch) {
   const db = await readDb();
   const order = db.orders?.[orderId];
-  if (!order?.kid) return null;
-  Object.assign(order.kid, patch);
+  if (!order) return null;
+  const { cid, primId, kid } = getOrderKid(db, order, characterId);
+  if (!kid) return null;
+  if (!order.kids || typeof order.kids !== "object") order.kids = {};
+  const updated = { ...kid, ...patch };
+  order.kids[cid] = updated;
+  if (cid === primId) order.kid = updated;
   await writeDb(db);
-  return order.kid;
+  return updated;
 }
 
 // Hydrate an order with its story's cells/title for the client. Text cells get
 // a `resolvedText` with the order's variable values substituted in.
+// ── Pricing module ─────────────────────────────────────────────────────────
+// Pricing is its own module (own access grant), kept entirely separate from the
+// creative story workflow. Prices are per-country and stored on the story as
+// `prices[CODE] = { price, discountPrice }`. A country with no usable price is
+// "waiting for price" (not live for orders).
+
+// List every story with just what the Pricing screen needs: id, title, the
+// story's own publish state, and the full per-country price map. The client
+// scopes the editable view to the country picked in the header.
+app.get(
+  "/api/pricing",
+  asyncHandler(async (_req, res) => {
+    const db = await readDb();
+    const rows = Object.values(db.stories)
+      // Only published stories are priceable — drafts are still in creative work.
+      .filter((s) => s.status === "published")
+      .sort((a, b) => b.createdAt - a.createdAt)
+      .map((s) => ({
+        id: s.id,
+        title: s.title || "Untitled story",
+        gender: s.gender || "female",
+        status: s.status || "draft",
+        prices: s.prices && typeof s.prices === "object" ? s.prices : {},
+      }));
+    res.json(rows);
+  })
+);
+
+// Set (or clear) a story's price in ONE country. Members may only price the
+// countries they're assigned to — "if I'm in Kuwait I price Kuwait". A blank or
+// non-positive price clears the entry, returning that market to "waiting".
+app.put(
+  "/api/pricing/:id",
+  asyncHandler(async (req, res) => {
+    const db = await readDb();
+    const story = db.stories[req.params.id];
+    if (!story) return res.status(404).json({ error: "Story not found" });
+
+    const cc = String(req.body?.country || "").toUpperCase();
+    const countryRec = getCountry(db.countries, cc);
+    if (!countryRec || !countryRec.enabled)
+      return res.status(400).json({ error: "Pick a valid country to price." });
+    if (AUTH_ENABLED && !req.me?.isAdmin && !canCountry(req.me, cc, db.countries))
+      return res.status(403).json({ error: `You don't have access to ${countryRec.name}.` });
+
+    const price = Number(req.body?.price);
+    const rawDiscount = req.body?.discountPrice;
+    const discount = rawDiscount === "" || rawDiscount == null ? null : Number(rawDiscount);
+
+    if (!(story.prices && typeof story.prices === "object")) story.prices = {};
+
+    // Blank / non-positive price → clear this market (back to "waiting").
+    if (!Number.isFinite(price) || price <= 0) {
+      delete story.prices[cc];
+      await writeDb(db);
+      return res.json({ id: story.id, country: cc, prices: story.prices });
+    }
+
+    if (discount != null && (!Number.isFinite(discount) || discount < 0))
+      return res.status(400).json({ error: "Discounted price must be a positive number." });
+    if (discount != null && discount >= price)
+      return res.status(400).json({ error: "Discounted price must be below the regular price." });
+
+    story.prices[cc] = { price, discountPrice: discount != null && discount > 0 ? discount : null };
+    await writeDb(db);
+    res.json({ id: story.id, country: cc, prices: story.prices });
+  })
+);
+
+// The country an order belongs to, falling back to the first enabled country for
+// legacy orders created before the multi-country model.
+function defaultCountryCode(db) {
+  return enabledCountries(db.countries)[0]?.code || "SA";
+}
+
 function hydrateOrder(db, order) {
   const story = db.stories[order.storyId];
   const vars = order.variables || {};
   // The order's language scopes which book(s) it produces. Legacy orders with no
   // language fall back to "both" so nothing they already show disappears.
   const language = ["en", "ar", "both"].includes(order.language) ? order.language : "both";
+
+  // Cast + per-character photos. The story drives the cast; the order carries one
+  // kid per character in `order.kids`. Legacy orders only have `order.kid`, which
+  // maps to the primary character; keep `kid` aliased so old readers keep working.
+  const characters = story ? ensureCharacters(story).characters : [];
+  const primaryId = characters[0]?.id || null;
+  let kids = order.kids && typeof order.kids === "object" ? { ...order.kids } : {};
+  if (order.kid && primaryId && !kids[primaryId]) kids[primaryId] = order.kid;
+  const kid = (primaryId && kids[primaryId]) || order.kid || null;
+
+  // Per-character names captured at intake, keyed by character.key for the
+  // {{name:<key>}} / {{nameAr:<key>}} tokens (primary doubles as {{Child_Name}}).
+  const names = {};
+  for (const c of characters) {
+    const k = kids[c.id];
+    names[c.key] = { name: k?.name || "", nameAr: k?.nameAr || "" };
+  }
+  names.__primary__ = characters[0] ? names[characters[0].key] : null;
+
   const scenes = (story?.scenes || [])
     .filter((c) => language === "both" || (c.lang || "en") === language)
-    .map((c) => (c.type === "text" ? { ...c, resolvedText: applyVars(c.text, vars) } : c));
+    .map((c) => (c.type === "text" ? { ...c, resolvedText: applyVars(c.text, vars, names) } : c));
+
+  // Country + price snapshot. New orders carry their own pricing; legacy ones get
+  // a best-effort price from the story's current price for display only.
+  const country = order.country || defaultCountryCode(db);
+  let pricing = order.pricing || null;
+  if (!pricing) {
+    const eff = effectivePrice(story?.prices?.[country]);
+    const rec = getCountry(db.countries, country);
+    if (eff && rec) {
+      pricing = {
+        ...computeOrderPricing(eff.effective, rec),
+        listPrice: eff.price,
+        discountPrice: eff.discountPrice,
+      };
+    }
+  }
+
+  // Customer snapshot for display. Legacy orders predate customers (null).
+  const customer = order.customerId ? db.customers?.[order.customerId] || null : null;
+
   return {
     ...order,
     language,
     storyTitle: story?.title || "(deleted story)",
     storyMissing: !story,
+    customer: customer
+      ? { id: customer.id, name: customer.name, phone: customer.phone, country: customer.country }
+      : null,
     scenes,
     variables: vars,
+    country,
+    pricing,
+    characters,
+    kids,
+    kid,
     // Age/gender/aspect live on the story; surface them for the order UI.
     age: story?.age ?? null,
     gender: story?.gender || "female",
@@ -2564,11 +3321,21 @@ function hydrateOrder(db, order) {
 
 app.get(
   "/api/orders",
-  asyncHandler(async (_req, res) => {
+  asyncHandler(async (req, res) => {
     const db = await readDb();
+    // Admins (and local/no-auth) see every country; members are scoped to theirs.
+    const isAdmin = !AUTH_ENABLED || req.me?.isAdmin;
+    const allowed = isAdmin ? null : allowedCountries(req.me, db.countries);
+    const wanted = String(req.query.country || "all");
+
     const orders = Object.values(db.orders || {})
-      .sort((a, b) => b.createdAt - a.createdAt)
-      .map((o) => hydrateOrder(db, o));
+      .map((o) => hydrateOrder(db, o))
+      .filter((o) => {
+        if (allowed && !allowed.includes(o.country)) return false;
+        if (wanted !== "all" && o.country !== wanted) return false;
+        return true;
+      })
+      .sort((a, b) => b.createdAt - a.createdAt);
     res.json(orders);
   })
 );
@@ -2576,24 +3343,53 @@ app.get(
 app.post(
   "/api/orders",
   asyncHandler(async (req, res) => {
-    const { title, storyId, variables, language } = req.body || {};
+    const { title, storyId, variables, language, country, customerId } = req.body || {};
     const db = await readDb();
-    if (!db.stories[storyId]) return res.status(400).json({ error: "Pick a valid story" });
-    if (db.stories[storyId].status !== "published")
+    const story = db.stories[storyId];
+    if (!story) return res.status(400).json({ error: "Pick a valid story" });
+    if (story.status !== "published")
       return res
         .status(400)
         .json({ error: "This story isn't published yet. Test and publish it before taking orders." });
+
+    // Every order belongs to a customer.
+    const customer = db.customers?.[customerId];
+    if (!customer) return res.status(400).json({ error: "Pick a customer for this order." });
+
+    const cc = String(country || "").toUpperCase();
+    const countryRec = getCountry(db.countries, cc);
+    if (!countryRec || !countryRec.enabled)
+      return res.status(400).json({ error: "Pick a valid country for this order." });
+    if (AUTH_ENABLED && !req.me?.isAdmin && !canCountry(req.me, cc, db.countries))
+      return res.status(403).json({ error: `You don't have access to ${countryRec.name}.` });
+
+    const eff = effectivePrice(story.prices?.[cc]);
+    if (!eff)
+      return res.status(400).json({ error: `This story is waiting for a price in ${countryRec.name}.` });
+
     db.orders ||= {};
     const id = nanoid(8);
     db.orders[id] = {
       id,
       title: (title || "Untitled order").trim(),
       storyId,
+      customerId: customer.id,
+      country: cc,
+      // Snapshot the price + tax so later edits never rewrite this order. The
+      // effective price (discount when present) drives the tax math; the list +
+      // discount prices ride along for display.
+      pricing: {
+        ...computeOrderPricing(eff.effective, countryRec),
+        listPrice: eff.price,
+        discountPrice: eff.discountPrice,
+      },
       // Which book(s) this order generates: "en", "ar", or "both".
       language: ["en", "ar", "both"].includes(language) ? language : "both",
       variables: variables && typeof variables === "object" ? variables : {},
       createdAt: Date.now(),
       kid: null,
+      // One uploaded child per cast character (keyed by character id).
+      kids: {},
       results: {},
     };
     await writeDb(db);
@@ -2607,6 +3403,9 @@ app.get(
     const db = await readDb();
     const order = db.orders?.[req.params.id];
     if (!order) return res.status(404).json({ error: "Order not found" });
+    const country = order.country || defaultCountryCode(db);
+    if (AUTH_ENABLED && !req.me?.isAdmin && !canCountry(req.me, country, db.countries))
+      return res.status(403).json({ error: "No access to this country's orders." });
     res.json(hydrateOrder(db, order));
   })
 );
@@ -2623,58 +3422,97 @@ app.delete(
   })
 );
 
-// Stage 1: upload the kid photo for an order.
+// Stage 1: upload a kid photo. `characterId` selects which cast member it's for;
+// omitted (legacy /kid) targets the story's primary character.
+async function handleKidUpload(req, res, characterId) {
+  const db = await readDb();
+  const order = db.orders?.[req.params.id];
+  if (!order) return res.status(404).json({ error: "Order not found" });
+  if (!req.file) return res.status(400).json({ error: "No kid photo uploaded" });
+
+  const cid = orderCharacterId(db, order, characterId);
+  const primId = primaryCharacterId(db.stories[order.storyId]);
+  const kid = newKid(req.file);
+  kid.rawFalUrl = await uploadToFal(path.join(UPLOAD_DIR, req.file.filename));
+  // Photo intake gate (see validateKidPhoto / derivePhotoStatus). Saved even on
+  // failure so the UI can show the original photo and the failure reasons.
+  await applyRawPhotoCheck(kid);
+  if (!order.kids || typeof order.kids !== "object") order.kids = {};
+  order.kids[cid] = kid;
+  if (cid === primId) order.kid = kid;
+  // A new photo invalidates every render that used the old cast.
+  order.results = {};
+  await writeDb(db);
+  res.json(hydrateOrder(db, order));
+}
+
+// Stage 2: restore + feature extraction for a character's kid.
+async function handleKidRestore(req, res, characterId) {
+  const db = await readDb();
+  const order = db.orders?.[req.params.id];
+  if (!order) return res.status(404).json({ error: "Order not found" });
+  const { kid } = getOrderKid(db, order, characterId);
+  if (!kid) return res.status(404).json({ error: "This child has no photo yet" });
+  if (kid.photoStatus === "needs_new_photo") return res.status(400).json({ error: PHOTO_GATE_MESSAGE });
+
+  const patch = await runRestore(kid);
+  await patchOrderKid(req.params.id, characterId, patch);
+  const db2 = await readDb();
+  res.json(hydrateOrder(db2, db2.orders[req.params.id]));
+}
+
+// Stage 3: anchor + score for a character's kid.
+async function handleKidAnchor(req, res, characterId) {
+  const db = await readDb();
+  const order = db.orders?.[req.params.id];
+  if (!order) return res.status(404).json({ error: "Order not found" });
+  const { kid } = getOrderKid(db, order, characterId);
+  if (!kid) return res.status(404).json({ error: "This child has no photo yet" });
+  if (kid.photoStatus === "needs_new_photo") return res.status(400).json({ error: PHOTO_GATE_MESSAGE });
+
+  const patch = await runAnchor(kid, req.body?.anchorPrompt);
+  await patchOrderKid(req.params.id, characterId, patch);
+  const db2 = await readDb();
+  res.json(hydrateOrder(db2, db2.orders[req.params.id]));
+}
+
+// Set a character's display name (used by {{name:<key>}} / {{nameAr:<key>}}).
+async function handleKidName(req, res, characterId) {
+  const order = (await readDb()).orders?.[req.params.id];
+  if (!order) return res.status(404).json({ error: "Order not found" });
+  const patch = {};
+  if (typeof req.body?.name === "string") patch.name = req.body.name.trim();
+  if (typeof req.body?.nameAr === "string") patch.nameAr = req.body.nameAr.trim();
+  const updated = await patchOrderKid(req.params.id, characterId, patch);
+  if (!updated) return res.status(404).json({ error: "This child has no photo yet" });
+  const db2 = await readDb();
+  res.json(hydrateOrder(db2, db2.orders[req.params.id]));
+}
+
+// Legacy single-kid routes (target the primary character).
+app.post("/api/orders/:id/kid", upload.single("kid"), asyncHandler((req, res) => handleKidUpload(req, res, null)));
+app.put("/api/orders/:id/kid/name", asyncHandler((req, res) => handleKidName(req, res, null)));
+app.put(
+  "/api/orders/:id/characters/:characterId/kid/name",
+  asyncHandler((req, res) => handleKidName(req, res, req.params.characterId))
+);
+app.post("/api/orders/:id/kid/restore", asyncHandler((req, res) => handleKidRestore(req, res, null)));
+app.post("/api/orders/:id/kid/anchor", asyncHandler((req, res) => handleKidAnchor(req, res, null)));
+
+// Per-character routes (multi-kid orders). Scoped under /characters/:characterId
+// to avoid colliding with the /kid/restore and /kid/anchor sub-paths above.
 app.post(
-  "/api/orders/:id/kid",
+  "/api/orders/:id/characters/:characterId/kid",
   upload.single("kid"),
-  asyncHandler(async (req, res) => {
-    const db = await readDb();
-    const order = db.orders?.[req.params.id];
-    if (!order) return res.status(404).json({ error: "Order not found" });
-    if (!req.file) return res.status(400).json({ error: "No kid photo uploaded" });
-
-    const kid = newKid(req.file);
-    kid.rawFalUrl = await uploadToFal(path.join(UPLOAD_DIR, req.file.filename));
-    // Photo intake gate (see validateKidPhoto / derivePhotoStatus). Saved even on
-    // failure so the UI can show the original photo and the failure reasons.
-    await applyRawPhotoCheck(kid);
-    order.kid = kid;
-    order.results = {};
-    await writeDb(db);
-    res.json(hydrateOrder(db, order));
-  })
+  asyncHandler((req, res) => handleKidUpload(req, res, req.params.characterId))
 );
-
-// Stage 2: restore + feature extraction.
 app.post(
-  "/api/orders/:id/kid/restore",
-  asyncHandler(async (req, res) => {
-    const db = await readDb();
-    const order = db.orders?.[req.params.id];
-    if (!order?.kid) return res.status(404).json({ error: "Order has no kid yet" });
-    if (order.kid.photoStatus === "needs_new_photo") return res.status(400).json({ error: PHOTO_GATE_MESSAGE });
-
-    const patch = await runRestore(order.kid);
-    await patchOrderKid(req.params.id, patch);
-    const db2 = await readDb();
-    res.json(hydrateOrder(db2, db2.orders[req.params.id]));
-  })
+  "/api/orders/:id/characters/:characterId/kid/restore",
+  asyncHandler((req, res) => handleKidRestore(req, res, req.params.characterId))
 );
-
-// Stage 3: anchor + score.
 app.post(
-  "/api/orders/:id/kid/anchor",
-  asyncHandler(async (req, res) => {
-    const db = await readDb();
-    const order = db.orders?.[req.params.id];
-    if (!order?.kid) return res.status(404).json({ error: "Order has no kid yet" });
-    if (order.kid.photoStatus === "needs_new_photo") return res.status(400).json({ error: PHOTO_GATE_MESSAGE });
-
-    const patch = await runAnchor(order.kid, req.body?.anchorPrompt);
-    await patchOrderKid(req.params.id, patch);
-    const db2 = await readDb();
-    res.json(hydrateOrder(db2, db2.orders[req.params.id]));
-  })
+  "/api/orders/:id/characters/:characterId/kid/anchor",
+  asyncHandler((req, res) => handleKidAnchor(req, res, req.params.characterId))
 );
 
 // Generate one scene for this order's kid.
@@ -2685,13 +3523,12 @@ app.post(
     const db = await readDb();
     const order = db.orders?.[req.params.id];
     if (!order) return res.status(404).json({ error: "Order not found" });
-    if (!order.kid) return res.status(400).json({ error: "Upload a kid photo first" });
-    if (order.kid.photoStatus === "needs_new_photo") return res.status(400).json({ error: PHOTO_GATE_MESSAGE });
 
     const story = db.stories[order.storyId];
     if (!story) return res.status(400).json({ error: "Order's story was deleted" });
     if (story.status !== "published")
       return res.status(400).json({ error: "This story is no longer published. Re-publish it to fulfill orders." });
+    ensureCharacters(story);
     const scene = story.scenes.find((s) => s.id === sceneId);
     if (!scene) return res.status(404).json({ error: "Scene not found" });
 
@@ -2701,41 +3538,97 @@ app.post(
         .status(400)
         .json({ error: "This page has no AI image to regenerate (it is text/overlay only)." });
 
-    // Replay the recipe that was tested and approved on the story for this page;
-    // only the child differs. Fall back to the request values for any page that
-    // somehow lacks an approved recipe.
-    const genMode = scene.approvedMode || mode || "face";
-    const genMethod = scene.approvedMethod || method || "edit";
-    const genPrompt =
-      scene.approvedPrompt != null ? scene.approvedPrompt : genMode === "identity" ? "" : prompt;
+    // Per-character kid map (legacy order.kid mirrors the primary character).
+    const charactersById = Object.fromEntries(story.characters.map((c) => [c.id, c]));
+    const primId = story.characters[0].id;
+    const kidsByCharacter = order.kids && typeof order.kids === "object" ? { ...order.kids } : {};
+    if (order.kid && !kidsByCharacter[primId]) kidsByCharacter[primId] = order.kid;
 
-    const result = await runGenerate({
-      scene: { ...scene, falUrl: baseFalUrl },
-      kid: order.kid,
-      prompt: genPrompt,
-      method: genMethod,
-      gender: gender || story.gender,
-      age: story.age,
-      workflowType,
-      mode: genMode,
-      extraPrompt: composeExtra(story, scene),
-      persistSceneStoryPrompt: async (desc) => {
-        const dbS = await readDb();
-        const sc = dbS.stories[order.storyId]?.scenes.find((s) => s.id === sceneId);
-        if (sc) {
-          sc.storyPrompt = desc;
-          await writeDb(dbS);
-        }
-      },
-    });
+    // Scoring level is shared by both generation paths.
+    const scoring = scene.identityScoring || (aiBaseElement(scene) || scene.falUrl ? "advisory" : "none");
+
+    // Multi-kid pages with face slots use composite-per-face; everything else
+    // falls back to the original single-kid generation (full back-compat).
+    const slots = Array.isArray(scene.kidSlots) ? scene.kidSlots.filter((s) => s.characterId) : [];
+
+    let result;
+    if (slots.length) {
+      const needed = [...new Set(slots.map((s) => s.characterId))];
+      const missing = needed.filter((cid) => {
+        const k = kidsByCharacter[cid];
+        return !k || k.photoStatus === "needs_new_photo";
+      });
+      if (missing.length)
+        return res.status(400).json({
+          error: `Upload an accepted photo for: ${missing
+            .map((cid) => charactersById[cid]?.label || "a child")
+            .join(", ")}`,
+        });
+      result = await runSlotComposite({
+        scene: { ...scene, falUrl: baseFalUrl },
+        baseFalUrl,
+        slots,
+        kidsByCharacter,
+        charactersById,
+        scoring,
+      });
+    } else {
+      if (!order.kid) return res.status(400).json({ error: "Upload a kid photo first" });
+      if (order.kid.photoStatus === "needs_new_photo") return res.status(400).json({ error: PHOTO_GATE_MESSAGE });
+
+      // Replay the recipe that was tested and approved on the story for this page;
+      // only the child differs. Fall back to the request values for any page that
+      // somehow lacks an approved recipe.
+      const genMode = scene.approvedMode || mode || "face";
+      const genMethod = scene.approvedMethod || method || "edit";
+      const genPrompt =
+        scene.approvedPrompt != null ? scene.approvedPrompt : genMode === "identity" ? "" : prompt;
+
+      result = await runGenerate({
+        scene: { ...scene, falUrl: baseFalUrl },
+        kid: order.kid,
+        prompt: genPrompt,
+        method: genMethod,
+        gender: gender || story.gender,
+        age: story.age,
+        workflowType,
+        mode: genMode,
+        extraPrompt: composeExtra(story, scene),
+        persistSceneStoryPrompt: async (desc) => {
+          const dbS = await readDb();
+          const sc = dbS.stories[order.storyId]?.scenes.find((s) => s.id === sceneId);
+          if (sc) {
+            sc.storyPrompt = desc;
+            await writeDb(dbS);
+          }
+        },
+      });
+    }
 
     const db2 = await readDb();
     const order2 = db2.orders[req.params.id];
     order2.results ||= {};
     order2.results[sceneId] = result;
+
+    // Reuse this render for any language twin that shares the same base image, so
+    // a "both" order produces each unique image once. Twins are visually identical
+    // (only their overlay text differs), so the same generated image is correct.
+    const filledIds = [sceneId];
+    const lang = ["en", "ar", "both"].includes(order2.language) ? order2.language : "both";
+    const baseKey = sceneBaseKey(scene);
+    if (baseKey) {
+      for (const sib of story.scenes) {
+        if (sib.id === sceneId) continue;
+        if (lang !== "both" && (sib.lang || "en") !== lang) continue;
+        if (sceneBaseKey(sib) === baseKey) {
+          order2.results[sib.id] = result;
+          filledIds.push(sib.id);
+        }
+      }
+    }
     await writeDb(db2);
 
-    res.json({ sceneId, result });
+    res.json({ sceneId, result, filledIds });
   })
 );
 
@@ -2779,7 +3672,25 @@ async function applyStoredSettings() {
   }
 }
 
+// Seed the country registry (GCC) on first boot so the app is usable immediately.
+// Admins can edit/add/remove afterward; we never overwrite an existing registry.
+async function seedCountriesIfEmpty() {
+  try {
+    const db = await readDb();
+    if (db.countries && Object.keys(db.countries).length) return;
+    db.countries = {};
+    SEED_COUNTRY_CODES.forEach((code, i) => {
+      db.countries[code] = defaultCountryRecord(code, { order: i });
+    });
+    await writeDb(db);
+    console.log(`  Seeded countries: ${SEED_COUNTRY_CODES.join(", ")}`);
+  } catch (err) {
+    console.error("[countries] failed to seed registry:", err.message);
+  }
+}
+
 await applyStoredSettings();
+await seedCountriesIfEmpty();
 
 app.listen(PORT, () => {
   console.log(`\n  Hazawy admin server  ->  http://localhost:${PORT}`);

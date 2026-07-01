@@ -1,8 +1,34 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { SignedIn, SignedOut, SignIn, UserButton, useAuth } from "@clerk/clerk-react";
+import {
+  AsYouType,
+  getCountries,
+  getCountryCallingCode,
+  parsePhoneNumberFromString,
+} from "libphonenumber-js";
 import { api, setAuthTokenGetter, clientId, eventsUrl } from "./api.js";
 import { SYMBOL_LIBRARY, SYMBOL_CATEGORIES, sanitizeSvg, tintSvg } from "./symbols.js";
 import { MODULES, MODULE_IDS } from "./shared/access.js";
+import {
+  PAGE_AREA_RATIO_CSS,
+  PRINT_SIZE_RECT,
+  PRINT_LEFT_RECT,
+  PRINT_RIGHT_RECT,
+  DESIGN_LEFT_RECT,
+  DESIGN_RIGHT_RECT,
+  PRINT_HALF_RATIO_CSS,
+  DESIGN_IN_HALF_LEFT,
+  DESIGN_IN_HALF_RIGHT,
+} from "./shared/print.js";
+import {
+  ISO_CATALOG,
+  ISO_CODES,
+  enabledCountries,
+  formatMoney,
+  currencyDecimals,
+  computeOrderPricing,
+  effectivePrice,
+} from "./shared/countries.js";
 
 // Human-readable label for a module id (falls back to the id itself).
 const moduleLabel = (id) => MODULES[id]?.label || id;
@@ -15,9 +41,10 @@ function parseHash() {
 }
 
 // Build the URL hash that represents the current navigation state.
-function buildHash(nav, story, order) {
+function buildHash(nav, story, order, pricingId) {
   if (nav === "stories") return story ? `#/stories/${story.id}` : "#/stories";
   if (nav === "orders") return order ? `#/orders/${order.id}` : "#/orders";
+  if (nav === "pricing") return pricingId ? `#/pricing/${pricingId}` : "#/pricing";
   return `#/${nav}`;
 }
 
@@ -118,34 +145,79 @@ function Studio({ me }) {
   const [nav, setNav] = useState(() => {
     const saved = localStorage.getItem("hazawy.nav");
     return saved && allowedModules.includes(saved) ? saved : allowedModules[0] || "orders";
-  }); // "stories" | "orders"
+  }); // "stories" | "orders" | "settings"
+
+  // Which tab the Settings page opens on. Lifted here so legacy #/variables and
+  // #/access links can deep-link straight to their tab inside Settings.
+  const [settingsTab, setSettingsTab] = useState("general");
+
+  // Collapsible sidebar (Cursor-style). Persisted so it stays where the user left it.
+  const [navOpen, setNavOpen] = useState(() => {
+    return localStorage.getItem("hazawy.navOpen") !== "0";
+  });
+  useEffect(() => {
+    localStorage.setItem("hazawy.navOpen", navOpen ? "1" : "0");
+  }, [navOpen]);
 
   const [stories, setStories] = useState([]);
   const [orders, setOrders] = useState([]);
 
   const [story, setStory] = useState(null); // selected story detail (null = table)
   const [order, setOrder] = useState(null); // selected order detail (null = table)
+  const [pricingId, setPricingId] = useState(null); // selected story id in Pricing (null = table)
 
   // Create modals
   const [creatingStory, setCreatingStory] = useState(false);
   const [creatingOrder, setCreatingOrder] = useState(false);
-  const [newOrderTitle, setNewOrderTitle] = useState("");
   const [newOrderStoryId, setNewOrderStoryId] = useState("");
   const [newOrderLanguage, setNewOrderLanguage] = useState("en"); // "en" | "ar" | "both"
   const [newOrderVars, setNewOrderVars] = useState({}); // variable name -> value
+  const [newOrderCountry, setNewOrderCountry] = useState(""); // market the order belongs to
+  const [newOrderCustomerId, setNewOrderCustomerId] = useState(""); // who the order is for
 
   // Order generation controls
   const [prompt, setPrompt] = useState("");
   const [showPrompt, setShowPrompt] = useState(false);
   const [mode, setMode] = useState("compose");
 
-  const [stage, setStage] = useState(null); // null | "uploading" | "restoring" | "anchoring"
-  const kidBusy = stage !== null;
+  // Per-character intake stage: characterId -> null|"uploading"|"restoring"|"anchoring".
+  const [kidStages, setKidStages] = useState({});
+  const kidBusy = Object.values(kidStages).some(Boolean);
+  const setStageFor = (cid, s) =>
+    setKidStages((m) => {
+      const next = { ...m };
+      if (s == null) delete next[cid];
+      else next[cid] = s;
+      return next;
+    });
   const [cellBusy, setCellBusy] = useState({}); // cellId -> bool (image upload)
   const [editorCellId, setEditorCellId] = useState(null); // open full-screen editor
+  const [editorSide, setEditorSide] = useState("right"); // which side (left/right) is being designed
   const [analyzing, setAnalyzing] = useState(false); // analyzing scene scoring
   const [busy, setBusy] = useState({}); // sceneId -> bool
   const [generatingAll, setGeneratingAll] = useState(false);
+
+  // Customers (people directory; phone is unique + country-validated)
+  const [customers, setCustomers] = useState([]);
+  const [editingCustomer, setEditingCustomer] = useState(null); // null = closed, {} = new, {…} = edit
+
+  // Pricing module: each story with its per-country price map. Owned here so the
+  // Pricing screen and its country-scoped editor read from one source.
+  const [pricing, setPricing] = useState([]);
+
+  // Countries (markets). The dynamic registry drives every selector/label.
+  const [countries, setCountries] = useState([]);
+  // Current country context for the header selector: "all" | <code>. Persisted.
+  // Today this is the source of "current country"; a hostname mapping can replace
+  // it later without touching anything else.
+  const [country, setCountry] = useState(() => localStorage.getItem("hazawy.country") || "all");
+  useEffect(() => {
+    localStorage.setItem("hazawy.country", country);
+  }, [country]);
+  // Orders are country-scoped: refetch whenever the header selector changes.
+  useEffect(() => {
+    api.listOrders(country).then(setOrders).catch(() => {});
+  }, [country]);
 
   // Variables (admin-managed text placeholders)
   const [variables, setVariables] = useState([]);
@@ -157,8 +229,6 @@ function Studio({ me }) {
   // User-uploaded SVG symbols, persisted so they can be reused across pages.
   const [customSymbols, setCustomSymbols] = useState([]);
 
-  const kidInput = useRef(null);
-
   useEffect(() => {
     api.config().then((c) => {
       setConfig(c);
@@ -166,21 +236,31 @@ function Studio({ me }) {
     });
     refreshStories();
     refreshOrders();
+    refreshCustomers();
+    refreshCountries();
+    refreshPricing();
     refreshVariables();
     refreshSymbols();
 
     // Restore the open page: prefer the URL hash, then fall back to localStorage.
     const { section, id } = parseHash();
-    if (
+    if (section === "variables" || section === "access") {
+      // Legacy links: these now live as tabs inside Settings.
+      if (canAccess("settings")) {
+        setNav("settings");
+        setSettingsTab(section);
+      }
+    } else if (
       section === "stories" ||
+      section === "pricing" ||
       section === "orders" ||
-      section === "variables" ||
-      section === "settings" ||
-      section === "access"
+      section === "customers" ||
+      section === "settings"
     ) {
       if (canAccess(section)) setNav(section);
       if (section === "stories" && id) api.getStory(id).then(setStory).catch(() => {});
       else if (section === "orders" && id) api.getOrder(id).then(setOrder).catch(() => {});
+      else if (section === "pricing" && id) setPricingId(id);
     } else {
       const sId = localStorage.getItem("hazawy.storyId");
       const oId = localStorage.getItem("hazawy.orderId");
@@ -195,9 +275,9 @@ function Studio({ me }) {
 
   // Keep the URL hash in sync with the current view so links are shareable.
   useEffect(() => {
-    const h = buildHash(nav, story, order);
+    const h = buildHash(nav, story, order, pricingId);
     if (window.location.hash !== h) window.location.hash = h;
-  }, [nav, story, order]);
+  }, [nav, story, order, pricingId]);
 
   // Respond to browser Back/Forward by reading the hash back into state.
   useEffect(() => {
@@ -213,16 +293,23 @@ function Studio({ me }) {
         if (id) {
           if (!order || order.id !== id) api.getOrder(id).then(setOrder).catch(() => setOrder(null));
         } else setOrder(null);
-      } else if (section === "variables") {
-        setNav("variables");
+      } else if (section === "customers") {
+        setNav("customers");
+        setStory(null);
+        setOrder(null);
+      } else if (section === "pricing") {
+        setNav("pricing");
+        setStory(null);
+        setOrder(null);
+        setPricingId(id || null);
+      } else if (section === "variables" || section === "access") {
+        // Legacy links: these now live as tabs inside Settings.
+        setNav("settings");
+        setSettingsTab(section);
         setStory(null);
         setOrder(null);
       } else if (section === "settings") {
         setNav("settings");
-        setStory(null);
-        setOrder(null);
-      } else if (section === "access") {
-        setNav("access");
         setStory(null);
         setOrder(null);
       }
@@ -234,6 +321,13 @@ function Studio({ me }) {
   // Persist navigation + open detail so a refresh stays put.
   useEffect(() => {
     localStorage.setItem("hazawy.nav", nav);
+  }, [nav]);
+
+  // The pricing list only contains published stories; refresh on entry so a
+  // story published elsewhere shows up (and an unpublished one drops off).
+  useEffect(() => {
+    if (nav === "pricing") refreshPricing();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [nav]);
 
   // Never sit on a page the user can't access (e.g. after a hash change).
@@ -337,10 +431,43 @@ function Studio({ me }) {
     api.listStories().then(setStories).catch((e) => setError(e.message));
   }
   function refreshOrders() {
-    api.listOrders().then(setOrders).catch((e) => setError(e.message));
+    api.listOrders(country).then(setOrders).catch((e) => setError(e.message));
+  }
+  function refreshCountries() {
+    api.listCountries(Boolean(me.isAdmin)).then(setCountries).catch((e) => setError(e.message));
   }
   function refreshVariables() {
     api.listVariables().then(setVariables).catch((e) => setError(e.message));
+  }
+  function refreshCustomers() {
+    api.listCustomers().then(setCustomers).catch((e) => setError(e.message));
+  }
+  function refreshPricing() {
+    api.listPricing().then(setPricing).catch((e) => setError(e.message));
+  }
+  // Set/clear one story's price in one country (the Pricing module). Members can
+  // only price the countries they're assigned to — the server enforces it too.
+  async function savePricing(storyId, { country: cc, price, discountPrice }) {
+    await api.updatePricing(storyId, { country: cc, price, discountPrice });
+    refreshPricing();
+  }
+  // Create or update a customer from the modal. `country` is the ISO code used to
+  // validate numbers typed without a leading "+". Throws on validation failure so
+  // the modal can keep itself open and surface the message.
+  async function saveCustomer({ id, name, phone, country }) {
+    if (id) await api.updateCustomer(id, { name, phone, country });
+    else await api.createCustomer(name, phone, country);
+    setEditingCustomer(null);
+    refreshCustomers();
+  }
+  async function deleteCustomer(id) {
+    if (!confirm("Delete this customer?")) return;
+    try {
+      await api.deleteCustomer(id);
+      refreshCustomers();
+    } catch (e) {
+      setError(e.message);
+    }
   }
   function refreshSymbols() {
     api.listSymbols().then(setCustomSymbols).catch((e) => setError(e.message));
@@ -361,6 +488,7 @@ function Studio({ me }) {
     setNav(n);
     setStory(null);
     setOrder(null);
+    setPricingId(null);
     setError("");
   }
 
@@ -431,6 +559,17 @@ function Studio({ me }) {
     }
   }
 
+  async function saveStoryCharacters(characters) {
+    if (!story) return;
+    setError("");
+    try {
+      setStory(await trackSave(api.updateStoryCharacters(story.id, characters)));
+      refreshStories();
+    } catch (err) {
+      setError(err.message);
+    }
+  }
+
   async function uploadCellImage(cellId, file) {
     if (!story || !file) return;
     setError("");
@@ -456,23 +595,30 @@ function Studio({ me }) {
     }
   }
 
-  async function saveCellElements(cellId, { elements, bgUrl, bgFalUrl, bgColor, safeZones, aiPrompt }) {
+  async function saveCellElements(
+    cellId,
+    { elements, bgUrl, bgFalUrl, bgColor, bgBlur, safeZones, kidSlots, aiPrompt },
+    side = "right"
+  ) {
     if (!story) return;
     setError("");
     try {
-      setStory(
-        await trackSave(
-          api.updateCell(story.id, cellId, {
-            type: "text",
-            elements,
-            safeZones: safeZones ?? [],
-            bgUrl: bgUrl ?? null,
-            bgFalUrl: bgFalUrl ?? null,
-            bgColor: bgColor ?? "#faf7ef",
-            ...(aiPrompt !== undefined ? { aiPrompt } : {}),
-          })
-        )
-      );
+      // Write the editor's working design into the chosen side; leave the other
+      // side untouched. getSides() also migrates any legacy single-design cell.
+      const cell = story.scenes.find((s) => s.id === cellId);
+      const sides = getSides(cell);
+      sides[side === "left" ? "left" : "right"] = {
+        elements: elements ?? [],
+        bgUrl: bgUrl ?? null,
+        bgFalUrl: bgFalUrl ?? null,
+        // null = no background color (transparent); preserve it as-is.
+        bgColor: bgColor ?? null,
+        bgBlur: bgBlur ?? 0,
+        kidSlots: kidSlots ?? [],
+        safeZones: safeZones ?? [],
+        aiPrompt: aiPrompt ?? "",
+      };
+      setStory(await trackSave(api.updateCell(story.id, cellId, { sides })));
       refreshStories();
     } catch (err) {
       setError(err.message);
@@ -598,23 +744,31 @@ function Studio({ me }) {
   }
 
   async function createOrder() {
-    if (!newOrderTitle.trim()) return setError("Give the order a name.");
     if (!newOrderStoryId) return setError("Pick a story for this order.");
+    if (!newOrderCustomerId) return setError("Pick a customer for this order.");
+    if (!newOrderCountry) return setError("Pick a country for this order.");
     // Fill in defaults for any variable the user left blank.
     const vars = {};
     for (const v of variables) {
       const val = newOrderVars[v.name];
       vars[v.name] = val != null && val !== "" ? val : v.defaultValue || "";
     }
+    // Auto-name the order: use the first filled variable (typically the child's
+    // name), falling back to the story title.
+    const story = stories.find((s) => s.id === newOrderStoryId);
+    const childName = Object.values(vars).find((x) => String(x).trim());
+    const title = String(childName || story?.title || "Order").trim();
     try {
-      const o = await api.createOrder(newOrderTitle.trim(), newOrderStoryId, {
+      const o = await api.createOrder(title, newOrderStoryId, {
         variables: vars,
         language: newOrderLanguage,
+        country: newOrderCountry,
+        customerId: newOrderCustomerId,
       });
-      setNewOrderTitle("");
       setNewOrderStoryId("");
       setNewOrderLanguage("en");
       setNewOrderVars({});
+      setNewOrderCustomerId("");
       setCreatingOrder(false);
       refreshOrders();
       setOrder(o);
@@ -634,52 +788,74 @@ function Studio({ me }) {
     }
   }
 
-  async function onUploadKid(e) {
+  // Read the kid object for a character (primary falls back to legacy order.kid).
+  function kidFor(o, characterId) {
+    if (!o) return null;
+    const primId = o.characters?.[0]?.id;
+    return o.kids?.[characterId] || (characterId === primId ? o.kid : null) || null;
+  }
+
+  async function onUploadKid(e, characterId) {
     const file = e.target.files?.[0];
     if (!file || !order) return;
+    const cid = characterId || order.characters?.[0]?.id;
     setError("");
     try {
-      setStage("uploading");
-      let o = await api.uploadOrderKid(order.id, file);
+      setStageFor(cid, "uploading");
+      let o = await api.uploadOrderKid(order.id, file, characterId);
       setOrder(o);
       refreshOrders();
       // Photo intake gate: an identity-unsafe photo stops here — no restore/anchor.
-      if (o?.kid?.photoStatus === "needs_new_photo") {
-        setError(o.kid.photoFailureReason || "Photo is not suitable. Please upload a clearer front-facing photo.");
+      let k = kidFor(o, cid);
+      if (k?.photoStatus === "needs_new_photo") {
+        setError(k.photoFailureReason || "Photo is not suitable. Please upload a clearer front-facing photo.");
         return;
       }
       // accepted / fixable / review → enhance. Fixable photos are re-validated
       // server-side during restore, so re-check the status afterwards.
-      setStage("restoring");
-      o = await api.restoreOrderKid(order.id);
+      setStageFor(cid, "restoring");
+      o = await api.restoreOrderKid(order.id, characterId);
       setOrder(o);
       refreshOrders();
-      if (o?.kid?.photoStatus === "needs_new_photo") {
-        setError(o.kid.photoFailureReason || "Photo could not be improved enough. Please upload a clearer photo.");
+      k = kidFor(o, cid);
+      if (k?.photoStatus === "needs_new_photo") {
+        setError(k.photoFailureReason || "Photo could not be improved enough. Please upload a clearer photo.");
         return;
       }
-      setStage("anchoring");
-      o = await api.anchorOrderKid(order.id);
+      setStageFor(cid, "anchoring");
+      o = await api.anchorOrderKid(order.id, characterId);
       setOrder(o);
       refreshOrders();
     } catch (err) {
       setError(err.message);
     } finally {
-      setStage(null);
-      if (kidInput.current) kidInput.current.value = "";
+      setStageFor(cid, null);
     }
   }
 
-  async function regenerateAnchor() {
-    if (!order?.kid) return;
+  async function regenerateAnchor(characterId) {
+    if (!order) return;
+    const cid = characterId || order.characters?.[0]?.id;
+    if (!kidFor(order, cid)) return;
     setError("");
     try {
-      setStage("anchoring");
-      setOrder(await api.anchorOrderKid(order.id));
+      setStageFor(cid, "anchoring");
+      setOrder(await api.anchorOrderKid(order.id, characterId));
     } catch (err) {
       setError(err.message);
     } finally {
-      setStage(null);
+      setStageFor(cid, null);
+    }
+  }
+
+  async function saveKidName(characterId, payload) {
+    if (!order) return;
+    setError("");
+    try {
+      setOrder(await api.setOrderKidName(order.id, characterId, payload));
+      refreshOrders();
+    } catch (err) {
+      setError(err.message);
     }
   }
 
@@ -700,10 +876,15 @@ function Studio({ me }) {
     if (!order?.kid) return setError("Upload a kid photo first.");
     setGeneratingAll(true);
     setError("");
+    // Pages sharing one base image (e.g. an English page and its Arabic twin) are
+    // generated once; the server fills the twin's result, so we skip it here.
+    const done = new Set();
     for (const scene of order.scenes.filter(sceneHasAiBase)) {
+      if (done.has(scene.id)) continue;
       setBusy((b) => ({ ...b, [scene.id]: true }));
       try {
-        await api.generateOrder(order.id, scene.id, prompt, { mode });
+        const res = await api.generateOrder(order.id, scene.id, prompt, { mode });
+        (res?.filledIds?.length ? res.filledIds : [scene.id]).forEach((id) => done.add(id));
         setOrder(await api.getOrder(order.id));
       } catch (e) {
         setError(`Scene failed: ${e.message}`);
@@ -717,12 +898,33 @@ function Studio({ me }) {
   const kid = order?.kid || null;
   const results = order?.results || {};
 
-  return (
-    <div className="flex h-full">
-      <NavSidebar nav={nav} onNav={switchNav} config={config} me={me} />
+  // Enabled countries this user may act in (admins -> all). Drives the header
+  // selector and the order-create picker.
+  const allowedCountryCodes =
+    me.countries && me.countries.length ? me.countries : enabledCountries(countries).map((c) => c.code);
+  const myCountries = enabledCountries(countries).filter((c) => allowedCountryCodes.includes(c.code));
 
-      <main className="flex-1 overflow-y-auto">
-        <div className="mx-auto max-w-6xl px-8 py-8">
+  return (
+    <div className="flex h-full flex-col overflow-x-hidden">
+      <AppHeader
+        navOpen={navOpen}
+        onToggle={() => setNavOpen((v) => !v)}
+        country={country}
+        onCountryChange={setCountry}
+        countryOptions={myCountries}
+      />
+
+      <div className="flex min-h-0 flex-1">
+        <NavSidebar
+          nav={nav}
+          onNav={switchNav}
+          config={config}
+          me={me}
+          open={navOpen}
+        />
+
+      <main className="min-w-0 flex-1 overflow-y-auto">
+        <div className="px-4 py-6 sm:px-6 sm:py-8 lg:px-8">
           {error && (
             <div className="mb-4 flex items-center justify-between rounded-lg border border-rose-500/40 bg-rose-500/10 px-4 py-3 text-sm text-rose-200">
               <span>{error}</span>
@@ -744,6 +946,31 @@ function Studio({ me }) {
             />
           )}
 
+          {nav === "pricing" && !pricingId && (
+            <PricingTable
+              rows={pricing}
+              myCountries={myCountries}
+              country={country}
+              isAdmin={Boolean(me.isAdmin)}
+              onOpen={(id) => {
+                setError("");
+                setPricingId(id);
+              }}
+            />
+          )}
+
+          {nav === "pricing" && pricingId && (
+            <PricingDetail
+              row={pricing.find((r) => r.id === pricingId) || null}
+              countries={countries}
+              myCountries={myCountries}
+              isAdmin={Boolean(me.isAdmin)}
+              onBack={() => setPricingId(null)}
+              onSave={savePricing}
+              onError={setError}
+            />
+          )}
+
           {nav === "stories" && story && !editorCellId && (
             <StoryDetail
               story={story}
@@ -755,11 +982,15 @@ function Studio({ me }) {
               onAddCell={addCell}
               onSaveTitle={saveStoryTitle}
               onSaveGender={saveStoryGender}
+              onSaveCharacters={saveStoryCharacters}
               onUploadCellImage={uploadCellImage}
               onUploadCellBackground={uploadCellBackground}
               onRemoveCellBackground={removeCellBackground}
               onSaveCellText={saveCellText}
-              onOpenEditor={setEditorCellId}
+              onOpenEditor={(id) => {
+                setEditorCellId(id);
+                setEditorSide("right");
+              }}
               onDeleteCell={deleteScene}
               onReorderCells={reorderScenes}
               onAnalyze={analyzeStory}
@@ -777,44 +1008,67 @@ function Studio({ me }) {
             const c = story.scenes.find((s) => s.id === editorCellId);
             if (!c) return null;
             const idx = story.scenes.findIndex((s) => s.id === editorCellId);
-            const label =
-              idx === 0 ? "Cover" : idx === story.scenes.length - 1 ? "Back cover" : `Page ${idx + 1}`;
+            const isCover = idx === 0;
+            // The page is one sheet; we edit one side at a time. The cover sheet
+            // is the wrap: back cover (left) + front cover (right).
+            const sideLabel = isCover
+              ? editorSide === "left"
+                ? "Back cover"
+                : "Front cover"
+              : editorSide === "left"
+              ? `Page ${idx * 2}`
+              : `Page ${idx * 2 + 1}`;
+            // Feed the editor just the active side's design (as a cell-shaped
+            // object) and remount it whenever the side changes. Legacy
+            // single-design fields are cleared so an empty side stays empty.
+            const sides = getSides(c);
+            const sideCell = {
+              id: c.id,
+              lang: c.lang,
+              type: "text",
+              localUrl: null,
+              text: "",
+              style: null,
+              ...sides[editorSide],
+            };
             return (
               <CellEditor
-                cell={c}
-                label={label}
+                key={`${c.id}:${editorSide}`}
+                cell={sideCell}
+                label={sideLabel}
+                side={editorSide}
+                onSwitchSide={(targetSide, design) => {
+                  if (targetSide === editorSide) return;
+                  saveCellElements(c.id, design, editorSide);
+                  setEditorSide(targetSide);
+                }}
                 aspect={story.aspect || "3:4"}
                 variables={variables}
+                characters={story.characters || []}
                 customSymbols={customSymbols}
                 onSaveSymbol={saveSymbol}
                 onDeleteSymbol={deleteCustomSymbol}
                 onUploadMedia={(file) => api.uploadMedia(file)}
-                onSave={saveCellElements}
+                onSave={(cellId, design) => saveCellElements(cellId, design, editorSide)}
                 onClose={() => setEditorCellId(null)}
               />
             );
           })()}
 
-          {nav === "variables" && (
-            <VariablesTable
+          {nav === "settings" && canAccess("settings") && (
+            <SettingsPage
+              me={me}
+              tab={settingsTab}
+              onTabChange={setSettingsTab}
               variables={variables}
-              onDelete={deleteVariable}
-              onCreate={() => {
+              onDeleteVariable={deleteVariable}
+              onCreateVariable={() => {
                 setError("");
                 setCreatingVariable(true);
               }}
-            />
-          )}
-
-          {nav === "settings" && canAccess("settings") && (
-            <SettingsPage
               onError={setError}
               onSaved={() => api.config().then(setConfig).catch(() => {})}
             />
-          )}
-
-          {nav === "access" && canAccess("access") && (
-            <AccessPage me={me} onError={setError} />
           )}
 
           {nav === "orders" && !order && (
@@ -828,6 +1082,9 @@ function Studio({ me }) {
                   setError("Create a story first, then you can make an order.");
                   return;
                 }
+                // Default the order's country to the header selection (when a
+                // specific one is active), else the first country the user can act in.
+                setNewOrderCountry(country !== "all" ? country : myCountries[0]?.code || "");
                 setCreatingOrder(true);
               }}
             />
@@ -836,6 +1093,7 @@ function Studio({ me }) {
           {nav === "orders" && order && (
             <OrderDetail
               order={order}
+              countries={countries}
               kid={kid}
               results={results}
               onBack={() => {
@@ -843,11 +1101,11 @@ function Studio({ me }) {
                 refreshOrders();
               }}
               onDelete={() => deleteOrder(order.id)}
-              kidInput={kidInput}
               onUploadKid={onUploadKid}
-              stage={stage}
+              kidStages={kidStages}
               kidBusy={kidBusy}
               regenerateAnchor={regenerateAnchor}
+              onSaveName={saveKidName}
               mode={mode}
               setMode={setMode}
               prompt={prompt}
@@ -861,8 +1119,24 @@ function Studio({ me }) {
               config={config}
             />
           )}
+
+          {nav === "customers" && (
+            <CustomersTable
+              customers={customers}
+              onCreate={() => {
+                setError("");
+                setEditingCustomer({});
+              }}
+              onEdit={(c) => {
+                setError("");
+                setEditingCustomer(c);
+              }}
+              onDelete={deleteCustomer}
+            />
+          )}
         </div>
       </main>
+      </div>
 
       {creatingStory && (
         <Modal title="Create story" onClose={() => setCreatingStory(false)}>
@@ -903,15 +1177,7 @@ function Studio({ me }) {
             (newOrderLanguage === "both" && enCount + arCount === 0));
         return (
         <Modal title="Create order" onClose={() => setCreatingOrder(false)}>
-          <label className="block text-xs uppercase tracking-wide text-zinc-500">Order name</label>
-          <input
-            autoFocus
-            value={newOrderTitle}
-            onChange={(e) => setNewOrderTitle(e.target.value)}
-            placeholder="e.g. Hessa"
-            className="mt-1 w-full rounded-md border border-[var(--color-border)] bg-[var(--color-panel-2)] px-3 py-2 text-sm focus:border-[var(--color-accent)] focus:outline-none"
-          />
-          <label className="mt-3 block text-xs uppercase tracking-wide text-zinc-500">Story</label>
+          <label className="block text-xs uppercase tracking-wide text-zinc-500">Story</label>
           <select
             value={newOrderStoryId}
             onChange={(e) => setNewOrderStoryId(e.target.value)}
@@ -931,6 +1197,63 @@ function Studio({ me }) {
               No published stories yet. Open a story, test it, and publish it before taking orders.
             </p>
           )}
+
+          <label className="mt-3 block text-xs uppercase tracking-wide text-zinc-500">Customer</label>
+          <select
+            value={newOrderCustomerId}
+            onChange={(e) => setNewOrderCustomerId(e.target.value)}
+            className="mt-1 w-full rounded-md border border-[var(--color-border)] bg-[var(--color-panel-2)] px-3 py-2 text-sm focus:border-[var(--color-accent)] focus:outline-none"
+          >
+            <option value="">Choose a customer…</option>
+            {customers.map((c) => (
+              <option key={c.id} value={c.id}>
+                {c.name} — {c.phone}
+              </option>
+            ))}
+          </select>
+          {customers.length === 0 && (
+            <p className="mt-1 text-xs text-amber-300">
+              No customers yet. Add one in the Customers tab before taking orders.
+            </p>
+          )}
+
+          <label className="mt-3 block text-xs uppercase tracking-wide text-zinc-500">Country</label>
+          <select
+            value={newOrderCountry}
+            onChange={(e) => setNewOrderCountry(e.target.value)}
+            className="mt-1 w-full rounded-md border border-[var(--color-border)] bg-[var(--color-panel-2)] px-3 py-2 text-sm focus:border-[var(--color-accent)] focus:outline-none"
+          >
+            <option value="">Choose a country…</option>
+            {myCountries.map((c) => {
+              const eff = selStory && effectivePrice(selStory.prices?.[c.code]);
+              return (
+                <option key={c.code} value={c.code} disabled={!eff}>
+                  {c.flag} {c.name}
+                  {eff ? ` — ${formatMoney(eff.effective, c.currency)}` : " (waiting for price)"}
+                </option>
+              );
+            })}
+          </select>
+          {(() => {
+            const rec = myCountries.find((c) => c.code === newOrderCountry);
+            const eff = rec && effectivePrice(selStory?.prices?.[rec.code]);
+            if (!rec || !eff) return null;
+            const p = computeOrderPricing(eff.effective, rec);
+            return (
+              <p className="mt-1 text-xs text-zinc-400">
+                {p.taxEnabled
+                  ? `${formatMoney(p.base, p.currency)} + ${p.taxLabel} ${p.taxRate}% = `
+                  : "Total: "}
+                <span className="font-medium text-zinc-200">{formatMoney(p.total, p.currency)}</span>
+                {eff.discountPrice != null && (
+                  <span className="ml-1 text-zinc-500 line-through">
+                    {formatMoney(eff.price, rec.currency)}
+                  </span>
+                )}
+              </p>
+            );
+          })()}
+
           <label className="mt-3 block text-xs uppercase tracking-wide text-zinc-500">Language</label>
           <div className="mt-1 grid grid-cols-3 gap-2">
             {langOpts.map((opt) => (
@@ -989,7 +1312,8 @@ function Studio({ me }) {
             </button>
             <button
               onClick={createOrder}
-              className="rounded-md bg-[var(--color-accent)] px-4 py-2 text-sm font-semibold text-black"
+              disabled={!newOrderStoryId || !newOrderCustomerId || !newOrderCountry}
+              className="rounded-md bg-[var(--color-accent)] px-4 py-2 text-sm font-semibold text-black disabled:cursor-not-allowed disabled:opacity-40"
             >
               Create
             </button>
@@ -1054,12 +1378,65 @@ function Studio({ me }) {
           </div>
         </Modal>
       )}
+
+      {editingCustomer && (
+        <CustomerModal
+          customer={editingCustomer}
+          onClose={() => setEditingCustomer(null)}
+          onSave={saveCustomer}
+        />
+      )}
     </div>
   );
 }
 
 /* ============================ VARIABLES TABLE ============================ */
 function VariablesTable({ variables, onDelete, onCreate }) {
+  const columns = [
+    {
+      key: "token",
+      header: "Token",
+      hideable: false,
+      sortValue: (v) => v.name,
+      render: (v) => <span className="font-mono text-[var(--color-accent)]">{`{{${v.name}}}`}</span>,
+    },
+    {
+      key: "label",
+      header: "Label",
+      sortValue: (v) => v.label,
+      render: (v) => <span className="text-zinc-300">{v.label}</span>,
+    },
+    {
+      key: "default",
+      header: "Default",
+      sortValue: (v) => v.defaultValue || "",
+      render: (v) => <span className="text-zinc-400">{v.defaultValue || "—"}</span>,
+    },
+    {
+      key: "created",
+      header: "Created",
+      sortValue: (v) => v.createdAt || 0,
+      render: (v) => <span className="text-zinc-400">{fmtDate(v.createdAt)}</span>,
+    },
+    {
+      key: "actions",
+      header: "",
+      sortable: false,
+      hideable: false,
+      align: "right",
+      render: (v) => (
+        <button
+          onClick={(e) => {
+            e.stopPropagation();
+            onDelete(v.id);
+          }}
+          className="rounded-md border border-[var(--color-border)] px-2.5 py-1 text-xs text-zinc-400 hover:bg-rose-600/20 hover:text-rose-200"
+        >
+          Delete
+        </button>
+      ),
+    },
+  ];
   return (
     <>
       <PageHeader
@@ -1071,49 +1448,429 @@ function VariablesTable({ variables, onDelete, onCreate }) {
       {variables.length === 0 ? (
         <EmptyTable text="No variables yet. Create one (e.g. Child_Name) and use it in story text cells." />
       ) : (
-        <Table head={["Token", "Label", "Default", "Created", ""]}>
-          {variables.map((v) => (
-            <tr key={v.id} className="border-t border-[var(--color-border)]">
-              <Td className="font-mono text-[var(--color-accent)]">{`{{${v.name}}}`}</Td>
-              <Td className="text-zinc-300">{v.label}</Td>
-              <Td className="text-zinc-400">{v.defaultValue || "—"}</Td>
-              <Td className="text-zinc-400">{fmtDate(v.createdAt)}</Td>
-              <Td className="text-right">
-                <button
-                  onClick={() => onDelete(v.id)}
-                  className="rounded-md border border-[var(--color-border)] px-2.5 py-1 text-xs text-zinc-400 hover:bg-rose-600/20 hover:text-rose-200"
-                >
-                  Delete
-                </button>
-              </Td>
-            </tr>
-          ))}
-        </Table>
+        <DataTable storageKey="variables" columns={columns} data={variables} rowKey={(v) => v.id} />
+      )}
+    </>
+  );
+}
+
+/* ============================ CUSTOMERS ============================ */
+
+// Localized English country names so the picker reads "Saudi Arabia" not "SA".
+const REGION_NAMES =
+  typeof Intl !== "undefined" && Intl.DisplayNames
+    ? new Intl.DisplayNames(["en"], { type: "region" })
+    : null;
+
+// Turn an ISO country code into its flag emoji (regional indicator symbols).
+function isoToFlag(iso) {
+  if (!iso || iso.length !== 2) return "🏳️";
+  return iso
+    .toUpperCase()
+    .replace(/./g, (ch) => String.fromCodePoint(127397 + ch.charCodeAt(0)));
+}
+
+function countryName(iso) {
+  return (iso && REGION_NAMES?.of(iso)) || iso || "—";
+}
+
+// All dialable countries: ISO, English name, calling code, flag — sorted by name.
+const COUNTRY_OPTIONS = getCountries()
+  .map((iso) => ({ iso, name: countryName(iso), code: getCountryCallingCode(iso), flag: isoToFlag(iso) }))
+  .sort((a, b) => a.name.localeCompare(b.name));
+
+// Default to Saudi Arabia (Hazawy's home market).
+const DEFAULT_COUNTRY = "SA";
+
+// Pretty-print a stored E.164 number as international format, e.g. +966 50 123 4567.
+function fmtPhone(e164) {
+  const p = parsePhoneNumberFromString(e164 || "");
+  return p ? p.formatInternational() : e164 || "—";
+}
+
+// A compact, searchable country picker. Replaces a native <select> (whose
+// OS-drawn list filled the whole screen with no way to search). Shows the
+// selected flag + calling code; opening it reveals a search box and a
+// height-capped, scrollable list filtered by country name or calling code.
+function CountrySelect({ value, onChange }) {
+  const [open, setOpen] = useState(false);
+  const [query, setQuery] = useState("");
+  const wrapRef = useRef(null);
+  const searchRef = useRef(null);
+
+  const selected = COUNTRY_OPTIONS.find((c) => c.iso === value);
+
+  const q = query.trim().toLowerCase();
+  const matches = q
+    ? COUNTRY_OPTIONS.filter(
+        (c) => c.name.toLowerCase().includes(q) || `+${c.code}`.includes(q) || c.code.includes(q)
+      )
+    : COUNTRY_OPTIONS;
+
+  // Close on outside click.
+  useEffect(() => {
+    if (!open) return;
+    function onDocClick(e) {
+      if (wrapRef.current && !wrapRef.current.contains(e.target)) setOpen(false);
+    }
+    document.addEventListener("mousedown", onDocClick);
+    return () => document.removeEventListener("mousedown", onDocClick);
+  }, [open]);
+
+  // Focus the search box when the menu opens; reset the query when it closes.
+  useEffect(() => {
+    if (open) searchRef.current?.focus();
+    else setQuery("");
+  }, [open]);
+
+  function pick(iso) {
+    onChange(iso);
+    setOpen(false);
+  }
+
+  return (
+    <div ref={wrapRef} className="relative sm:w-52">
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        className="flex w-full items-center gap-2 rounded-md border border-[var(--color-border)] bg-[var(--color-panel-2)] px-2 py-2 text-left text-sm focus:border-[var(--color-accent)] focus:outline-none"
+      >
+        <span className="text-base leading-none">{selected?.flag || "🏳️"}</span>
+        <span className="min-w-0 flex-1 truncate text-zinc-200">{selected?.name || "Select"}</span>
+        <span className="font-mono text-xs text-zinc-500">+{selected?.code}</span>
+        <span className="text-zinc-500">▾</span>
+      </button>
+
+      {open && (
+        <div className="absolute left-0 z-50 mt-1 w-full min-w-[16rem] overflow-hidden rounded-md border border-[var(--color-border)] bg-[var(--color-panel)] shadow-xl">
+          <div className="border-b border-[var(--color-border)] p-2">
+            <input
+              ref={searchRef}
+              value={query}
+              onChange={(e) => setQuery(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Escape") setOpen(false);
+                if (e.key === "Enter" && matches[0]) {
+                  e.preventDefault();
+                  pick(matches[0].iso);
+                }
+              }}
+              placeholder="Search country or code…"
+              className="w-full rounded-md border border-[var(--color-border)] bg-[var(--color-panel-2)] px-2.5 py-1.5 text-sm text-zinc-100 placeholder:text-zinc-600 focus:border-[var(--color-accent)] focus:outline-none"
+            />
+          </div>
+          <ul className="max-h-60 overflow-y-auto py-1">
+            {matches.length === 0 ? (
+              <li className="px-3 py-2 text-sm text-zinc-500">No matches</li>
+            ) : (
+              matches.map((c) => (
+                <li key={c.iso}>
+                  <button
+                    type="button"
+                    onClick={() => pick(c.iso)}
+                    className={`flex w-full items-center gap-2 px-3 py-1.5 text-left text-sm transition hover:bg-[var(--color-panel-2)] ${
+                      c.iso === value ? "text-[var(--color-accent)]" : "text-zinc-200"
+                    }`}
+                  >
+                    <span className="w-5 shrink-0 text-center">{c.iso === value ? "✓" : ""}</span>
+                    <span className="text-base leading-none">{c.flag}</span>
+                    <span className="min-w-0 flex-1 truncate">{c.name}</span>
+                    <span className="font-mono text-xs text-zinc-500">+{c.code}</span>
+                  </button>
+                </li>
+              ))
+            )}
+          </ul>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// Phone entry: a country picker (sets the calling code) + the local number. The
+// number is validated against the chosen country's real length/format, so a too
+// short / too long number is rejected before it can be saved.
+function PhoneField({ country, national, onCountryChange, onNationalChange, valid, autoFocus }) {
+  const opt = COUNTRY_OPTIONS.find((c) => c.iso === country);
+  const showError = national.trim().length > 0 && !valid;
+  return (
+    <div>
+      <div className="mt-1 flex flex-col gap-2 sm:flex-row">
+        <CountrySelect value={country} onChange={onCountryChange} />
+        <div className="relative flex-1">
+          <span className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 font-mono text-sm text-zinc-500">
+            +{opt?.code}
+          </span>
+          <input
+            autoFocus={autoFocus}
+            inputMode="tel"
+            value={national}
+            onChange={(e) => onNationalChange(e.target.value)}
+            placeholder="50 123 4567"
+            className={`w-full rounded-md border bg-[var(--color-panel-2)] py-2 pl-14 pr-9 font-mono text-sm focus:outline-none ${
+              showError
+                ? "border-rose-500/60 focus:border-rose-500"
+                : "border-[var(--color-border)] focus:border-[var(--color-accent)]"
+            }`}
+          />
+          {national.trim().length > 0 && (
+            <span
+              className={`absolute right-3 top-1/2 -translate-y-1/2 text-sm ${
+                valid ? "text-[var(--color-accent-2)]" : "text-rose-400"
+              }`}
+            >
+              {valid ? "✓" : "✕"}
+            </span>
+          )}
+        </div>
+      </div>
+      <p className={`mt-1 text-[11px] ${showError ? "text-rose-400" : "text-zinc-600"}`}>
+        {showError
+          ? `That's not a valid ${countryName(country)} number — check the length.`
+          : `Number length is validated for ${countryName(country)}.`}
+      </p>
+    </div>
+  );
+}
+
+// Create / edit a customer. Owns its own draft so validation feedback is instant
+// and the parent only hears about a successful, validated save.
+function CustomerModal({ customer, onClose, onSave }) {
+  const isEdit = Boolean(customer?.id);
+  const initial = useMemo(() => {
+    if (customer?.phone) {
+      const p = parsePhoneNumberFromString(customer.phone);
+      if (p) return { country: p.country || customer.country || DEFAULT_COUNTRY, national: p.nationalNumber };
+    }
+    return { country: customer?.country || DEFAULT_COUNTRY, national: "" };
+  }, [customer]);
+
+  const [name, setName] = useState(customer?.name || "");
+  const [country, setCountry] = useState(initial.country);
+  const [national, setNational] = useState(initial.national);
+  const [error, setError] = useState("");
+  const [saving, setSaving] = useState(false);
+
+  const parsed = national.trim() ? parsePhoneNumberFromString(national, country) : null;
+  const phoneValid = Boolean(parsed && parsed.isValid());
+  const canSave = name.trim().length > 0 && phoneValid && !saving;
+
+  async function submit() {
+    if (!name.trim()) return setError("Enter the customer's name.");
+    if (!phoneValid) return setError("Enter a valid phone number for the selected country.");
+    setSaving(true);
+    setError("");
+    try {
+      await onSave({ id: customer?.id, name: name.trim(), phone: parsed.number, country });
+    } catch (e) {
+      setError(e.message);
+      setSaving(false);
+    }
+  }
+
+  return (
+    <Modal title={isEdit ? "Edit customer" : "Add customer"} onClose={onClose}>
+      <label className="block text-xs uppercase tracking-wide text-zinc-500">Name</label>
+      <input
+        autoFocus
+        value={name}
+        onChange={(e) => setName(e.target.value)}
+        placeholder="e.g. Sara Al-Otaibi"
+        className="mt-1 w-full rounded-md border border-[var(--color-border)] bg-[var(--color-panel-2)] px-3 py-2 text-sm focus:border-[var(--color-accent)] focus:outline-none"
+      />
+
+      <label className="mt-4 block text-xs uppercase tracking-wide text-zinc-500">Phone number</label>
+      <PhoneField
+        country={country}
+        national={national}
+        onCountryChange={setCountry}
+        onNationalChange={setNational}
+        valid={phoneValid}
+      />
+
+      {error && <p className="mt-3 text-sm text-rose-400">{error}</p>}
+
+      <div className="mt-4 flex justify-end gap-2">
+        <button
+          onClick={onClose}
+          className="rounded-md border border-[var(--color-border)] px-4 py-2 text-sm text-zinc-300 hover:bg-[var(--color-panel-2)]"
+        >
+          Cancel
+        </button>
+        <button
+          onClick={submit}
+          disabled={!canSave}
+          className="rounded-md bg-[var(--color-accent)] px-4 py-2 text-sm font-semibold text-black disabled:cursor-not-allowed disabled:opacity-40"
+        >
+          {saving ? "Saving…" : isEdit ? "Save" : "Add customer"}
+        </button>
+      </div>
+    </Modal>
+  );
+}
+
+function CustomersTable({ customers, onCreate, onEdit, onDelete }) {
+  const columns = [
+    {
+      key: "name",
+      header: "Name",
+      hideable: false,
+      filterType: "text",
+      sortValue: (c) => c.name,
+      render: (c) => <span className="font-medium text-zinc-100">{c.name}</span>,
+    },
+    {
+      key: "phone",
+      header: "Phone",
+      filterType: "text",
+      sortValue: (c) => c.phone,
+      filterValue: (c) => fmtPhone(c.phone),
+      render: (c) => <span className="font-mono text-zinc-300">{fmtPhone(c.phone)}</span>,
+    },
+    {
+      key: "country",
+      header: "Country",
+      filterType: "select",
+      sortValue: (c) => countryName(c.country),
+      filterValue: (c) => countryName(c.country),
+      render: (c) => (
+        <span className="text-zinc-400">
+          {isoToFlag(c.country)} {countryName(c.country)}
+        </span>
+      ),
+    },
+    {
+      key: "created",
+      header: "Created",
+      filterType: "date",
+      sortValue: (c) => c.createdAt || 0,
+      filterValue: (c) => fmtDate(c.createdAt),
+      render: (c) => <span className="text-zinc-400">{fmtDate(c.createdAt)}</span>,
+    },
+    {
+      key: "actions",
+      header: "",
+      sortable: false,
+      hideable: false,
+      align: "right",
+      render: (c) => (
+        <div className="flex justify-end gap-2">
+          <button
+            onClick={(e) => {
+              e.stopPropagation();
+              onEdit(c);
+            }}
+            className="rounded-md border border-[var(--color-border)] px-2.5 py-1 text-xs text-zinc-400 hover:bg-[var(--color-panel-2)] hover:text-zinc-200"
+          >
+            Edit
+          </button>
+          <button
+            onClick={(e) => {
+              e.stopPropagation();
+              onDelete(c.id);
+            }}
+            className="rounded-md border border-[var(--color-border)] px-2.5 py-1 text-xs text-zinc-400 hover:bg-rose-600/20 hover:text-rose-200"
+          >
+            Delete
+          </button>
+        </div>
+      ),
+    },
+  ];
+  return (
+    <>
+      <PageHeader title="Customers" actionLabel="+ Add customer" onAction={onCreate} />
+      {customers.length === 0 ? (
+        <EmptyTable text="No customers yet. Add one with their name and phone number." />
+      ) : (
+        <DataTable
+          storageKey="customers"
+          columns={columns}
+          data={customers}
+          rowKey={(c) => c.id}
+          onRowClick={(c) => onEdit(c)}
+        />
       )}
     </>
   );
 }
 
 /* ============================ NAV SIDEBAR ============================ */
-function NavSidebar({ nav, onNav, config, me }) {
+// Slim top bar shown only while the sidebar is collapsed — its sole job is the
+// reopen button. When the sidebar is open, the collapse control lives inside it.
+function AppHeader({ navOpen, onToggle, country, onCountryChange, countryOptions = [] }) {
+  return (
+    <header className="flex h-14 shrink-0 items-center gap-3 border-b border-[var(--color-border)] bg-[var(--color-panel)] px-4">
+      <button
+        onClick={onToggle}
+        title={navOpen ? "Collapse sidebar" : "Expand sidebar"}
+        aria-label={navOpen ? "Collapse sidebar" : "Expand sidebar"}
+        aria-pressed={navOpen}
+        className="flex h-8 w-8 items-center justify-center rounded-md text-zinc-400 transition hover:bg-[var(--color-panel-2)] hover:text-zinc-200"
+      >
+        <PanelIcon open={navOpen} />
+      </button>
+
+      {countryOptions.length > 0 && (
+        <div className="ml-auto flex items-center gap-2">
+          <GlobeIcon />
+          <select
+            value={country}
+            onChange={(e) => onCountryChange(e.target.value)}
+            title="Country"
+            className="rounded-md border border-[var(--color-border)] bg-[var(--color-panel-2)] px-2 py-1.5 text-sm text-zinc-200 focus:border-[var(--color-accent)] focus:outline-none"
+          >
+            <option value="all">All countries</option>
+            {countryOptions.map((c) => (
+              <option key={c.code} value={c.code}>
+                {c.flag} {c.name}
+              </option>
+            ))}
+          </select>
+        </div>
+      )}
+    </header>
+  );
+}
+
+function GlobeIcon() {
+  return (
+    <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true" className="text-zinc-500">
+      <circle cx="8" cy="8" r="6.5" stroke="currentColor" strokeWidth="1.2" />
+      <path d="M1.5 8h13M8 1.5c2 2 2 11 0 13M8 1.5c-2 2-2 11 0 13" stroke="currentColor" strokeWidth="1.2" />
+    </svg>
+  );
+}
+
+// Sidebar / panel toggle glyph (mirrors Cursor's top-left panel icon).
+function PanelIcon({ open }) {
+  return (
+    <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+      <rect x="1.5" y="2.5" width="13" height="11" rx="1.5" stroke="currentColor" strokeWidth="1.2" />
+      <line x1="6" y1="2.5" x2="6" y2="13.5" stroke="currentColor" strokeWidth="1.2" />
+      {open && <rect x="2.5" y="3.5" width="2.5" height="9" rx="0.5" fill="currentColor" opacity="0.5" />}
+    </svg>
+  );
+}
+
+function NavSidebar({ nav, onNav, config, me, open = true }) {
   // Render straight from the modules the server granted, in their declared
   // order, using the shared MODULES metadata for label + icon.
   const allowed = me?.modules || [];
-  const items = MODULE_IDS.filter((id) => allowed.includes(id)).map((id) => ({
+  const items = MODULE_IDS.filter((id) => allowed.includes(id) && !MODULES[id].hideFromNav).map((id) => ({
     id,
     label: MODULES[id].label,
     icon: MODULES[id].icon,
   }));
 
   return (
-    <aside className="flex w-64 flex-col border-r border-[var(--color-border)] bg-[var(--color-panel)]">
-      <div className="border-b border-[var(--color-border)] px-5 py-4">
-        <div className="text-lg font-semibold">
-          Hazawy <span className="text-[var(--color-accent)]">Studio</span>
-        </div>
-        <div className="mt-1 text-xs text-zinc-500">personalized storybooks</div>
-      </div>
-
+    <aside
+      className={`flex shrink-0 flex-col overflow-hidden bg-[var(--color-panel)] transition-[width] duration-200 ease-in-out ${
+        open ? "w-64 border-r border-[var(--color-border)]" : "w-0 border-r-0"
+      }`}
+    >
+      {/* Fixed-width inner wrapper so content doesn't reflow while the width animates. */}
+      <div className="flex h-full w-64 flex-col">
       <nav className="flex-1 p-3">
         {items.map((it) => (
           <button
@@ -1140,10 +1897,6 @@ function NavSidebar({ nav, onNav, config, me }) {
           </div>
         </div>
       )}
-
-      <div className="border-t border-[var(--color-border)] px-4 py-3 text-xs">
-        <StatusDot ok={config?.falConfigured} label="fal.ai" />
-        <StatusDot ok={config?.checkerEnabled} label="AI checker" muted />
       </div>
     </aside>
   );
@@ -1155,6 +1908,8 @@ function AccessPage({ me, onError }) {
   const [email, setEmail] = useState("");
   const [role, setRole] = useState("member");
   const [modules, setModules] = useState(["stories", "orders"]);
+  const [inviteCountries, setInviteCountries] = useState([]);
+  const [countryOpts, setCountryOpts] = useState([]);
   const [inviting, setInviting] = useState(false);
 
   const assignable = data?.assignableModules || ["stories", "orders", "variables"];
@@ -1164,6 +1919,10 @@ function AccessPage({ me, onError }) {
       .listAccessUsers()
       .then(setData)
       .catch((e) => onError?.(e.message));
+    api
+      .listCountries()
+      .then(setCountryOpts)
+      .catch(() => {});
   }
 
   useEffect(() => {
@@ -1183,10 +1942,12 @@ function AccessPage({ me, onError }) {
       await api.inviteAccessUser(trimmed, {
         role,
         modules: role === "admin" ? assignable : modules,
+        countries: role === "admin" ? [] : inviteCountries,
       });
       setEmail("");
       setRole("member");
       setModules(["stories", "orders"]);
+      setInviteCountries([]);
       load();
     } catch (e) {
       onError?.(e.message);
@@ -1273,6 +2034,24 @@ function AccessPage({ me, onError }) {
             </div>
           )}
 
+          {role === "member" && countryOpts.length > 0 && (
+            <div className="mb-3">
+              <div className="mb-1 text-xs uppercase tracking-wide text-zinc-500">
+                Countries {inviteCountries.length === 0 && <span className="normal-case text-zinc-600">(none = all)</span>}
+              </div>
+              <div className="flex flex-wrap gap-2">
+                {countryOpts.map((c) => (
+                  <PageChip
+                    key={c.code}
+                    label={`${c.flag} ${c.name}`}
+                    active={inviteCountries.includes(c.code)}
+                    onClick={() => toggleModule(inviteCountries, setInviteCountries, c.code)}
+                  />
+                ))}
+              </div>
+            </div>
+          )}
+
           <button
             onClick={invite}
             disabled={inviting}
@@ -1322,23 +2101,54 @@ function AccessPage({ me, onError }) {
                     </div>
 
                     {u.role === "admin" ? (
-                      <div className="text-xs text-zinc-500">Full access to all modules.</div>
+                      <div className="text-xs text-zinc-500">Full access to all modules and countries.</div>
                     ) : (
-                      <div className="flex flex-wrap gap-2">
-                        {assignable.map((p) => (
-                          <PageChip
-                            key={p}
-                            label={moduleLabel(p)}
-                            active={(u.modules || []).includes(p)}
-                            onClick={() => {
-                              const current = u.modules || [];
-                              const nextModules = current.includes(p)
-                                ? current.filter((x) => x !== p)
-                                : [...current, p];
-                              changeUser(u.email, { modules: nextModules });
-                            }}
-                          />
-                        ))}
+                      <div className="space-y-3">
+                        <div>
+                          <div className="mb-1 text-xs uppercase tracking-wide text-zinc-500">Modules</div>
+                          <div className="flex flex-wrap gap-2">
+                            {assignable.map((p) => (
+                              <PageChip
+                                key={p}
+                                label={moduleLabel(p)}
+                                active={(u.modules || []).includes(p)}
+                                onClick={() => {
+                                  const current = u.modules || [];
+                                  const nextModules = current.includes(p)
+                                    ? current.filter((x) => x !== p)
+                                    : [...current, p];
+                                  changeUser(u.email, { modules: nextModules });
+                                }}
+                              />
+                            ))}
+                          </div>
+                        </div>
+                        {countryOpts.length > 0 && (
+                          <div>
+                            <div className="mb-1 text-xs uppercase tracking-wide text-zinc-500">
+                              Countries{" "}
+                              {(u.countries || []).length === 0 && (
+                                <span className="normal-case text-zinc-600">(none = all)</span>
+                              )}
+                            </div>
+                            <div className="flex flex-wrap gap-2">
+                              {countryOpts.map((c) => (
+                                <PageChip
+                                  key={c.code}
+                                  label={`${c.flag} ${c.name}`}
+                                  active={(u.countries || []).includes(c.code)}
+                                  onClick={() => {
+                                    const current = u.countries || [];
+                                    const next = current.includes(c.code)
+                                      ? current.filter((x) => x !== c.code)
+                                      : [...current, c.code];
+                                    changeUser(u.email, { countries: next });
+                                  }}
+                                />
+                              ))}
+                            </div>
+                          </div>
+                        )}
                       </div>
                     )}
                   </div>
@@ -1374,8 +2184,294 @@ const FAL_MODELS = [
   { id: "gpt_image_2", label: "GPT Image 2", endpoint: "openai/gpt-image-2" },
 ];
 
-function SettingsPage({ onError, onSaved }) {
-  const [tab, setTab] = useState("general");
+/* ============================ COUNTRIES (SETTINGS) ============================ */
+
+// Admin registry of operating countries (markets). Add/edit/remove, set currency
+// and per-country tax. Drives every selector, label, and pricing input in the app.
+function CountriesSettings({ onError, onChanged }) {
+  const [list, setList] = useState([]);
+  const [editing, setEditing] = useState(null); // null | {} (new) | record (edit)
+  const [busy, setBusy] = useState(false);
+
+  function load() {
+    api.listCountries(true).then(setList).catch((e) => onError?.(e.message));
+  }
+  useEffect(() => {
+    load();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  async function save(form) {
+    setBusy(true);
+    onError?.("");
+    try {
+      if (editing?.code) {
+        await api.updateCountry(form.code, {
+          name: form.name,
+          currency: form.currency,
+          enabled: form.enabled,
+          tax: form.tax,
+        });
+      } else {
+        await api.createCountry(form);
+      }
+      setEditing(null);
+      load();
+      onChanged?.();
+    } catch (e) {
+      onError?.(e.message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function remove(c) {
+    if (!confirm(`Remove ${c.name}? Existing orders keep their saved price; new pricing/selectors will drop it.`))
+      return;
+    try {
+      await api.deleteCountry(c.code);
+      load();
+      onChanged?.();
+    } catch (e) {
+      onError?.(e.message);
+    }
+  }
+
+  async function toggleEnabled(c) {
+    try {
+      await api.updateCountry(c.code, { enabled: !c.enabled });
+      load();
+      onChanged?.();
+    } catch (e) {
+      onError?.(e.message);
+    }
+  }
+
+  return (
+    <div className="max-w-3xl">
+      <div className="mb-4 flex items-center justify-between gap-3">
+        <p className="text-sm text-zinc-400">
+          Markets you operate in. Each has its own currency, tax, and per-story pricing.
+        </p>
+        <button
+          onClick={() => setEditing({})}
+          className="shrink-0 rounded-md bg-[var(--color-accent)] px-3 py-1.5 text-sm font-semibold text-black"
+        >
+          + Add country
+        </button>
+      </div>
+
+      {list.length === 0 ? (
+        <EmptyTable text="No countries yet. Add one to start pricing and taking orders." />
+      ) : (
+        <div className="overflow-hidden rounded-xl border border-[var(--color-border)]">
+          {list.map((c) => (
+            <div
+              key={c.code}
+              className="flex flex-wrap items-center gap-3 border-b border-[var(--color-border)] bg-[var(--color-panel)] px-4 py-3 last:border-b-0"
+            >
+              <span className="text-lg">{c.flag}</span>
+              <div className="min-w-0 flex-1">
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="font-medium text-zinc-100">{c.name}</span>
+                  <span className="text-xs text-zinc-500">
+                    {c.code} · {c.currency}
+                  </span>
+                  {!c.enabled && (
+                    <span className="rounded bg-zinc-700/40 px-1.5 py-0.5 text-[10px] uppercase text-zinc-400">
+                      Disabled
+                    </span>
+                  )}
+                </div>
+                <div className="text-xs text-zinc-500">
+                  {c.tax?.enabled
+                    ? `${c.tax.label} ${c.tax.rate}% ${c.tax.inclusive ? "(inclusive)" : "(added on top)"}`
+                    : "No tax"}
+                </div>
+              </div>
+              <button
+                onClick={() => toggleEnabled(c)}
+                className="rounded-md border border-[var(--color-border)] px-2.5 py-1 text-xs text-zinc-400 hover:bg-[var(--color-panel-2)]"
+              >
+                {c.enabled ? "Disable" : "Enable"}
+              </button>
+              <button
+                onClick={() => setEditing(c)}
+                className="rounded-md border border-[var(--color-border)] px-2.5 py-1 text-xs text-zinc-400 hover:bg-[var(--color-panel-2)] hover:text-zinc-200"
+              >
+                Edit
+              </button>
+              <button
+                onClick={() => remove(c)}
+                className="rounded-md border border-[var(--color-border)] px-2.5 py-1 text-xs text-zinc-400 hover:bg-rose-600/20 hover:text-rose-200"
+              >
+                Remove
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {editing && (
+        <CountryModal
+          existing={editing.code ? editing : null}
+          taken={list.map((c) => c.code)}
+          busy={busy}
+          onClose={() => setEditing(null)}
+          onSave={save}
+        />
+      )}
+    </div>
+  );
+}
+
+function CountryModal({ existing, taken = [], busy, onClose, onSave }) {
+  const isEdit = Boolean(existing);
+  const available = ISO_CODES.filter((code) => !taken.includes(code) || code === existing?.code);
+
+  const [code, setCode] = useState(existing?.code || available[0] || "");
+  const meta = ISO_CATALOG[code] || {};
+  const [name, setName] = useState(existing?.name || meta.name || "");
+  const [currency, setCurrency] = useState(existing?.currency || meta.currency || "");
+  const [enabled, setEnabled] = useState(existing?.enabled ?? true);
+  const [taxEnabled, setTaxEnabled] = useState(existing?.tax?.enabled ?? false);
+  const [taxRate, setTaxRate] = useState(existing?.tax?.rate != null ? String(existing.tax.rate) : "15");
+  const [taxInclusive, setTaxInclusive] = useState(existing?.tax?.inclusive ?? false);
+  const [taxLabel, setTaxLabel] = useState(existing?.tax?.label || "VAT");
+
+  function pick(newCode) {
+    setCode(newCode);
+    const m = ISO_CATALOG[newCode] || {};
+    setName(m.name || "");
+    setCurrency(m.currency || "");
+  }
+
+  function submit() {
+    onSave({
+      code,
+      name: name.trim(),
+      currency: currency.trim().toUpperCase(),
+      enabled,
+      tax: {
+        enabled: taxEnabled,
+        rate: Number(taxRate) || 0,
+        inclusive: taxInclusive,
+        label: taxLabel.trim() || "VAT",
+      },
+    });
+  }
+
+  const inputCls =
+    "mt-1 w-full rounded-md border border-[var(--color-border)] bg-[var(--color-panel-2)] px-3 py-2 text-sm focus:border-[var(--color-accent)] focus:outline-none";
+
+  return (
+    <Modal title={isEdit ? `Edit ${existing.name}` : "Add country"} onClose={onClose}>
+      {!isEdit &&
+        (available.length === 0 ? (
+          <p className="text-sm text-amber-300">Every supported country has already been added.</p>
+        ) : (
+          <>
+            <label className="block text-xs uppercase tracking-wide text-zinc-500">Country</label>
+            <select value={code} onChange={(e) => pick(e.target.value)} className={inputCls}>
+              {available.map((cc) => (
+                <option key={cc} value={cc}>
+                  {ISO_CATALOG[cc].flag} {ISO_CATALOG[cc].name}
+                </option>
+              ))}
+            </select>
+          </>
+        ))}
+
+      <div className="mt-3 grid grid-cols-2 gap-3">
+        <div>
+          <label className="block text-xs uppercase tracking-wide text-zinc-500">Name</label>
+          <input value={name} onChange={(e) => setName(e.target.value)} className={inputCls} />
+        </div>
+        <div>
+          <label className="block text-xs uppercase tracking-wide text-zinc-500">Currency</label>
+          <input
+            value={currency}
+            onChange={(e) => setCurrency(e.target.value)}
+            placeholder="SAR"
+            className={`${inputCls} font-mono uppercase`}
+          />
+        </div>
+      </div>
+
+      <label className="mt-3 flex items-center gap-2 text-sm text-zinc-300">
+        <input type="checkbox" checked={enabled} onChange={(e) => setEnabled(e.target.checked)} />
+        Enabled (shown in selectors and available for new orders)
+      </label>
+
+      <div className="mt-4 rounded-lg border border-[var(--color-border)] bg-[var(--color-panel-2)] p-3">
+        <label className="flex items-center gap-2 text-sm font-medium text-zinc-200">
+          <input type="checkbox" checked={taxEnabled} onChange={(e) => setTaxEnabled(e.target.checked)} />
+          Charge tax in this country
+        </label>
+        {taxEnabled && (
+          <div className="mt-3 grid grid-cols-3 gap-3">
+            <div>
+              <label className="block text-xs uppercase tracking-wide text-zinc-500">Label</label>
+              <input value={taxLabel} onChange={(e) => setTaxLabel(e.target.value)} className={inputCls} />
+            </div>
+            <div>
+              <label className="block text-xs uppercase tracking-wide text-zinc-500">Rate %</label>
+              <input
+                type="number"
+                min="0"
+                step="0.1"
+                value={taxRate}
+                onChange={(e) => setTaxRate(e.target.value)}
+                className={`${inputCls} tabular-nums`}
+              />
+            </div>
+            <div>
+              <label className="block text-xs uppercase tracking-wide text-zinc-500">Mode</label>
+              <select
+                value={taxInclusive ? "inc" : "exc"}
+                onChange={(e) => setTaxInclusive(e.target.value === "inc")}
+                className={inputCls}
+              >
+                <option value="exc">Added on top</option>
+                <option value="inc">Included in price</option>
+              </select>
+            </div>
+          </div>
+        )}
+      </div>
+
+      <div className="mt-4 flex justify-end gap-2">
+        <button
+          onClick={onClose}
+          className="rounded-md border border-[var(--color-border)] px-4 py-2 text-sm text-zinc-300 hover:bg-[var(--color-panel-2)]"
+        >
+          Cancel
+        </button>
+        <button
+          onClick={submit}
+          disabled={busy || !code || !name.trim() || !currency.trim()}
+          className="rounded-md bg-[var(--color-accent)] px-4 py-2 text-sm font-semibold text-black disabled:cursor-not-allowed disabled:opacity-40"
+        >
+          {busy ? "Saving…" : isEdit ? "Save" : "Add country"}
+        </button>
+      </div>
+    </Modal>
+  );
+}
+
+function SettingsPage({
+  me,
+  tab: controlledTab,
+  onTabChange,
+  variables = [],
+  onDeleteVariable,
+  onCreateVariable,
+  onError,
+  onSaved,
+}) {
+  const [localTab, setLocalTab] = useState("general");
+  const tab = controlledTab ?? localTab;
+  const setTab = onTabChange ?? setLocalTab;
   const [settings, setSettings] = useState(null);
   const [falKey, setFalKey] = useState("");
   const [showFal, setShowFal] = useState(false);
@@ -1441,12 +2537,16 @@ function SettingsPage({ onError, onSaved }) {
 
   return (
     <>
-      <PageHeader title="Settings" subtitle="fal.ai key, the model, and test images for this server." />
+      <PageHeader title="Settings" subtitle="fal.ai key, the model, test images, variables, and access." />
 
       <div className="mb-6 flex gap-1 border-b border-[var(--color-border)]">
         {[
           { id: "general", label: "General" },
+          { id: "countries", label: "Countries" },
           { id: "test-images", label: "Test images" },
+          { id: "variables", label: "Variables" },
+          { id: "access", label: "Access" },
+          { id: "history", label: "History" },
         ].map((t) => (
           <button
             key={t.id}
@@ -1462,8 +2562,20 @@ function SettingsPage({ onError, onSaved }) {
         ))}
       </div>
 
-      {tab === "test-images" ? (
+      {tab === "countries" ? (
+        <CountriesSettings onError={onError} onChanged={onSaved} />
+      ) : tab === "test-images" ? (
         <TestImagesSettings onError={onError} />
+      ) : tab === "variables" ? (
+        <VariablesTable
+          variables={variables}
+          onDelete={onDeleteVariable}
+          onCreate={onCreateVariable}
+        />
+      ) : tab === "access" ? (
+        <AccessPage me={me} onError={onError} />
+      ) : tab === "history" ? (
+        <HistoryLog onError={onError} />
       ) : (
       <div className="max-w-2xl space-y-6">
         <Section title="fal.ai API key">
@@ -1551,6 +2663,191 @@ function SettingsPage({ onError, onSaved }) {
           {saved && <span className="text-sm text-[var(--color-accent-2)]">Saved ✓</span>}
         </div>
       </div>
+      )}
+    </>
+  );
+}
+
+/* ============================ HISTORY LOG ============================ */
+// Per-entity-type metadata for the history log (icon + readable label).
+const HISTORY_ENTITY_META = {
+  story: { icon: "📖", label: "Story" },
+  order: { icon: "🧾", label: "Order" },
+  variable: { icon: "🔤", label: "Variable" },
+  symbol: { icon: "✳️", label: "Symbol" },
+  "test-image": { icon: "🖼️", label: "Test image" },
+  settings: { icon: "⚙️", label: "Settings" },
+  access: { icon: "👥", label: "Access" },
+};
+
+const HISTORY_FILTERS = [
+  { id: "", label: "All" },
+  { id: "story", label: "Stories" },
+  { id: "order", label: "Orders" },
+  { id: "variable", label: "Variables" },
+  { id: "access", label: "Access" },
+  { id: "settings", label: "Settings" },
+];
+
+function fmtWhen(ts) {
+  if (!ts) return "—";
+  const d = new Date(ts);
+  return d.toLocaleString(undefined, {
+    month: "short",
+    day: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+  });
+}
+
+// Admin-only activity feed. Lists every recorded change newest-first; clicking a
+// row expands the full related timeline for that same item (its `target`).
+function HistoryLog({ onError }) {
+  const [entries, setEntries] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [entity, setEntity] = useState("");
+  const [query, setQuery] = useState("");
+  const [expandedId, setExpandedId] = useState(null);
+
+  function load() {
+    setLoading(true);
+    api
+      .listHistory({ limit: 1000 })
+      .then((res) => setEntries(Array.isArray(res?.entries) ? res.entries : []))
+      .catch((e) => onError?.(e.message))
+      .finally(() => setLoading(false));
+  }
+
+  useEffect(() => {
+    load();
+  }, []);
+
+  // All entries that share a target, newest-first — an item's related history.
+  function relatedFor(target) {
+    return entries.filter((e) => e.target === target);
+  }
+
+  const q = query.trim().toLowerCase();
+  const filtered = entries.filter((e) => {
+    if (entity && e.entity !== entity) return false;
+    if (!q) return true;
+    return (
+      (e.action || "").toLowerCase().includes(q) ||
+      (e.name || "").toLowerCase().includes(q) ||
+      (e.actor || "").toLowerCase().includes(q)
+    );
+  });
+
+  return (
+    <>
+      <PageHeader
+        title="History"
+        subtitle="Every change made in the system. Click a row to see the full timeline for that item."
+        actionLabel="Refresh"
+        onAction={load}
+      />
+
+      <div className="mb-4 flex flex-wrap items-center gap-3">
+        <div className="flex flex-wrap gap-2">
+          {HISTORY_FILTERS.map((f) => (
+            <PageChip
+              key={f.id || "all"}
+              label={f.label}
+              active={entity === f.id}
+              onClick={() => setEntity(f.id)}
+            />
+          ))}
+        </div>
+        <input
+          value={query}
+          onChange={(e) => setQuery(e.target.value)}
+          placeholder="Search action, item, or person…"
+          className="ml-auto min-w-[220px] flex-1 rounded-lg border border-[var(--color-border)] bg-[var(--color-panel-2)] px-3 py-2 text-sm text-zinc-100 placeholder:text-zinc-600 focus:border-[var(--color-accent)] focus:outline-none"
+        />
+      </div>
+
+      {loading ? (
+        <div className="flex items-center gap-2 py-10 text-sm text-zinc-500">
+          <Spinner /> Loading history…
+        </div>
+      ) : filtered.length === 0 ? (
+        <EmptyTable text="No history yet. Changes you make across the app will show up here." />
+      ) : (
+        <div className="space-y-2">
+          {filtered.map((e) => {
+            const meta = HISTORY_ENTITY_META[e.entity] || { icon: "•", label: e.entity };
+            const related = relatedFor(e.target);
+            const isOpen = expandedId === e.id;
+            return (
+              <div
+                key={e.id}
+                className="overflow-hidden rounded-lg border border-[var(--color-border)] bg-[var(--color-panel-2)]/40"
+              >
+                <button
+                  onClick={() => setExpandedId(isOpen ? null : e.id)}
+                  className="flex w-full items-center gap-3 px-4 py-3 text-left transition hover:bg-[var(--color-panel-2)]/70"
+                >
+                  <span className="text-base" title={meta.label}>
+                    {meta.icon}
+                  </span>
+                  <div className="min-w-0 flex-1">
+                    <div className="truncate text-sm text-zinc-100">
+                      {e.action}
+                      {e.name && (
+                        <span className="text-zinc-400">
+                          {" — "}
+                          <span className="text-zinc-300">{e.name}</span>
+                        </span>
+                      )}
+                    </div>
+                    <div className="mt-0.5 flex items-center gap-2 text-xs text-zinc-500">
+                      <span className="text-zinc-400">{e.actor || "local"}</span>
+                      <span>·</span>
+                      <span>{fmtWhen(e.at)}</span>
+                      <span className="rounded-full border border-[var(--color-border)] px-1.5 py-0.5 text-[10px] uppercase tracking-wide text-zinc-500">
+                        {meta.label}
+                      </span>
+                    </div>
+                  </div>
+                  <span className="shrink-0 text-xs text-zinc-500">
+                    {related.length > 1 ? `${related.length} related` : ""}
+                    <span className="ml-2 inline-block">{isOpen ? "▾" : "▸"}</span>
+                  </span>
+                </button>
+
+                {isOpen && (
+                  <div className="border-t border-[var(--color-border)] bg-[var(--color-panel)]/40 px-4 py-3">
+                    <div className="mb-2 text-xs uppercase tracking-wide text-zinc-500">
+                      Related history ({related.length})
+                    </div>
+                    <ol className="space-y-0">
+                      {related.map((r, i) => (
+                        <li key={r.id} className="flex gap-3">
+                          <div className="flex flex-col items-center">
+                            <span
+                              className={`mt-1.5 h-2 w-2 shrink-0 rounded-full ${
+                                r.id === e.id ? "bg-[var(--color-accent)]" : "bg-zinc-600"
+                              }`}
+                            />
+                            {i < related.length - 1 && (
+                              <span className="w-px flex-1 bg-[var(--color-border)]" />
+                            )}
+                          </div>
+                          <div className="min-w-0 flex-1 pb-3">
+                            <div className="truncate text-sm text-zinc-200">{r.action}</div>
+                            <div className="text-xs text-zinc-500">
+                              {r.actor || "local"} · {fmtWhen(r.at)}
+                            </div>
+                          </div>
+                        </li>
+                      ))}
+                    </ol>
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
       )}
     </>
   );
@@ -1695,9 +2992,9 @@ function KeyInput({ value, onChange, show, onToggle, placeholder }) {
 /* ============================ TABLES ============================ */
 function PageHeader({ title, subtitle, actionLabel, onAction, actionDisabled, headerAction, children }) {
   return (
-    <header className="mb-6 flex items-center justify-between">
-      <div>
-        <div className="flex items-center gap-3">
+    <header className="mb-6 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+      <div className="min-w-0">
+        <div className="flex flex-wrap items-center gap-3">
           <h1 className="text-2xl font-semibold">{title}</h1>
           {children}
         </div>
@@ -1709,7 +3006,7 @@ function PageHeader({ title, subtitle, actionLabel, onAction, actionDisabled, he
             <button
               onClick={onAction}
               disabled={actionDisabled}
-              className="inline-flex items-center gap-2 rounded-lg bg-[var(--color-accent)] px-4 py-2 text-sm font-semibold text-black disabled:cursor-not-allowed disabled:opacity-60"
+              className="inline-flex w-full items-center justify-center gap-2 rounded-lg bg-[var(--color-accent)] px-4 py-2 text-sm font-semibold text-black disabled:cursor-not-allowed disabled:opacity-60 sm:w-auto"
             >
               {actionDisabled && <Spinner />}
               {actionLabel}
@@ -1745,39 +3042,68 @@ function fmtDate(ts) {
   });
 }
 
+const genderLabelOf = (g) => (g === "male" ? "Boy" : g === "non-binary" ? "Child" : "Girl");
+
 function StoriesTable({ stories, onOpen, onDelete, onCreate }) {
+  const columns = [
+    {
+      key: "title",
+      header: "Title",
+      hideable: false,
+      filterType: "text",
+      sortValue: (s) => s.title,
+      render: (s) => <span className="font-medium text-zinc-100">{s.title}</span>,
+    },
+    {
+      key: "status",
+      header: "Status",
+      filterType: "select",
+      sortValue: (s) => s.status,
+      filterValue: (s) => (s.status === "published" ? "Published" : "Draft"),
+      render: (s) => <StatusPill status={s.status} />,
+    },
+    {
+      key: "child",
+      header: "Child",
+      filterType: "select",
+      sortValue: (s) => genderLabelOf(s.gender),
+      filterValue: (s) => genderLabelOf(s.gender),
+      render: (s) => <span className="text-zinc-400">{genderLabelOf(s.gender)}</span>,
+    },
+    {
+      key: "scenes",
+      header: "Scenes",
+      align: "right",
+      filterType: "number",
+      sortValue: (s) => s.scenes.length,
+      render: (s) => s.scenes.length,
+    },
+    {
+      key: "created",
+      header: "Created",
+      filterType: "date",
+      sortValue: (s) => s.createdAt || 0,
+      filterValue: (s) => fmtDate(s.createdAt),
+      render: (s) => <span className="text-zinc-400">{fmtDate(s.createdAt)}</span>,
+    },
+  ];
   return (
     <>
       <PageHeader
         title="Stories"
-        subtitle={`${stories.length} stor${stories.length === 1 ? "y" : "ies"}`}
         actionLabel="+ Create story"
         onAction={onCreate}
       />
       {stories.length === 0 ? (
         <EmptyTable text="No stories yet. Create one and upload its scene templates." />
       ) : (
-        <Table head={["Title", "Status", "Child", "Scenes", "Created"]}>
-          {stories.map((s) => {
-            const genderLabel =
-              s.gender === "male" ? "Boy" : s.gender === "non-binary" ? "Child" : "Girl";
-            return (
-            <tr
-              key={s.id}
-              onClick={() => onOpen(s.id)}
-              className="cursor-pointer border-t border-[var(--color-border)] hover:bg-[var(--color-panel-2)]/40"
-            >
-              <Td className="font-medium text-zinc-100">{s.title}</Td>
-              <Td>
-                <StatusPill status={s.status} />
-              </Td>
-              <Td className="text-zinc-400">{genderLabel}</Td>
-              <Td>{s.scenes.length}</Td>
-              <Td className="text-zinc-400">{fmtDate(s.createdAt)}</Td>
-            </tr>
-            );
-          })}
-        </Table>
+        <DataTable
+          storageKey="stories"
+          columns={columns}
+          data={stories}
+          rowKey={(s) => s.id}
+          onRowClick={(s) => onOpen(s.id)}
+        />
       )}
     </>
   );
@@ -1789,73 +3115,783 @@ function orderRef(id) {
 }
 
 function OrdersTable({ orders, onOpen, onDelete, onCreate }) {
+  const generatedCount = (o) => Object.keys(o.results || {}).length;
+  const columns = [
+    {
+      key: "order",
+      header: "Order",
+      hideable: false,
+      sortValue: (o) => o.title,
+      render: (o) => <span className="font-medium text-zinc-100">{o.title}</span>,
+    },
+    {
+      key: "orderId",
+      header: "Order ID",
+      sortValue: (o) => orderRef(o.id),
+      render: (o) => <span className="font-mono text-xs text-zinc-500">{orderRef(o.id)}</span>,
+    },
+    {
+      key: "child",
+      header: "Child",
+      sortValue: (o) => genderLabelOf(o.gender),
+      render: (o) => <span className="text-zinc-400">{genderLabelOf(o.gender)}</span>,
+    },
+    {
+      key: "story",
+      header: "Story",
+      sortValue: (o) => o.storyTitle,
+      render: (o) => <span className="text-zinc-400">{o.storyTitle}</span>,
+    },
+    {
+      key: "customer",
+      header: "Customer",
+      filterType: "text",
+      sortValue: (o) => o.customer?.name || "",
+      filterValue: (o) => o.customer?.name || "",
+      render: (o) =>
+        o.customer ? (
+          <span className="text-zinc-400">{o.customer.name}</span>
+        ) : (
+          <span className="text-zinc-600">—</span>
+        ),
+    },
+    {
+      key: "country",
+      header: "Country",
+      filterType: "select",
+      sortValue: (o) => countryName(o.country),
+      filterValue: (o) => countryName(o.country),
+      render: (o) => (
+        <span className="text-zinc-400">
+          {isoToFlag(o.country)} {countryName(o.country)}
+        </span>
+      ),
+    },
+    {
+      key: "total",
+      header: "Total",
+      align: "right",
+      filterType: "number",
+      sortValue: (o) => o.pricing?.total ?? 0,
+      render: (o) =>
+        o.pricing ? (
+          <span className="tabular-nums text-zinc-200">{formatMoney(o.pricing.total, o.pricing.currency)}</span>
+        ) : (
+          <span className="text-zinc-600">—</span>
+        ),
+    },
+    {
+      key: "photo",
+      header: "Photo",
+      sortValue: (o) => (o.kid ? 1 : 0),
+      render: (o) =>
+        o.kid ? (
+          <span className="text-[var(--color-accent-2)]">✓</span>
+        ) : (
+          <span className="text-zinc-600">—</span>
+        ),
+    },
+    {
+      key: "generated",
+      header: "Generated",
+      align: "right",
+      sortValue: (o) => generatedCount(o),
+      render: (o) => `${generatedCount(o)}/${o.scenes.length}`,
+    },
+    {
+      key: "created",
+      header: "Created",
+      sortValue: (o) => o.createdAt || 0,
+      render: (o) => <span className="text-zinc-400">{fmtDate(o.createdAt)}</span>,
+    },
+  ];
   return (
     <>
       <PageHeader
         title="Orders"
-        subtitle={`${orders.length} order${orders.length === 1 ? "" : "s"}`}
         actionLabel="+ Create order"
         onAction={onCreate}
       />
       {orders.length === 0 ? (
         <EmptyTable text="No orders yet. Create one, choose a story, and upload a kid's photo." />
       ) : (
-        <Table head={["Order", "Order ID", "Child", "Story", "Photo", "Generated", "Created"]}>
-          {orders.map((o) => {
-            const generated = Object.keys(o.results || {}).length;
-            const genderLabel =
-              o.gender === "male" ? "Boy" : o.gender === "non-binary" ? "Child" : "Girl";
-            return (
-              <tr
-                key={o.id}
-                onClick={() => onOpen(o.id)}
-                className="cursor-pointer border-t border-[var(--color-border)] hover:bg-[var(--color-panel-2)]/40"
-              >
-                <Td className="font-medium text-zinc-100">{o.title}</Td>
-                <Td className="font-mono text-xs text-zinc-500">{orderRef(o.id)}</Td>
-                <Td className="text-zinc-400">{genderLabel}</Td>
-                <Td className="text-zinc-400">{o.storyTitle}</Td>
-                <Td>
-                  {o.kid ? (
-                    <span className="text-[var(--color-accent-2)]">✓</span>
-                  ) : (
-                    <span className="text-zinc-600">—</span>
-                  )}
-                </Td>
-                <Td>
-                  {generated}/{o.scenes.length}
-                </Td>
-                <Td className="text-zinc-400">{fmtDate(o.createdAt)}</Td>
-              </tr>
-            );
-          })}
-        </Table>
+        <DataTable
+          storageKey="orders"
+          columns={columns}
+          data={orders}
+          rowKey={(o) => o.id}
+          onRowClick={(o) => onOpen(o.id)}
+        />
       )}
     </>
   );
 }
 
-function Table({ head, children }) {
+// ── Reusable data table ──────────────────────────────────────────────────────
+// Column-driven table with click-to-sort headers, a gear menu to show/hide
+// columns, and page-size based pagination. Per-table user preferences (sort,
+// hidden columns, page size) are remembered in localStorage via `storageKey`.
+//
+// columns: [{
+//   key, header,
+//   render?(row) -> node,        // defaults to row[key]
+//   sortValue?(row) -> primitive,// defaults to render-less row[key]
+//   sortable?: boolean,          // default true
+//   hideable?: boolean,          // default true (false keeps it always shown)
+//   align?: "left" | "right" | "center",
+//   thClassName?, tdClassName?,
+// }]
+const TABLE_PREFS_KEY = "hazawy.tablePrefs";
+const PAGE_SIZE_OPTIONS = [10, 25, 50, 100, 200];
+
+function loadTablePrefs(storageKey) {
+  if (!storageKey) return {};
+  try {
+    const all = JSON.parse(localStorage.getItem(TABLE_PREFS_KEY) || "{}");
+    return all[storageKey] || {};
+  } catch {
+    return {};
+  }
+}
+
+function saveTablePrefs(storageKey, prefs) {
+  if (!storageKey) return;
+  try {
+    const all = JSON.parse(localStorage.getItem(TABLE_PREFS_KEY) || "{}");
+    all[storageKey] = prefs;
+    localStorage.setItem(TABLE_PREFS_KEY, JSON.stringify(all));
+  } catch {
+    /* storage unavailable */
+  }
+}
+
+function compareValues(a, b) {
+  if (a == null && b == null) return 0;
+  if (a == null) return -1;
+  if (b == null) return 1;
+  if (typeof a === "number" && typeof b === "number") return a - b;
+  if (typeof a === "boolean" && typeof b === "boolean") return a === b ? 0 : a ? 1 : -1;
+  return String(a).localeCompare(String(b), undefined, { numeric: true, sensitivity: "base" });
+}
+
+/* ===================== TABLE FILTERS ===================== */
+// Operator catalog per data type. `arity` = how many value inputs the operator
+// needs (0 = none, 1 = single, 2 = range). Used to build a small query-builder.
+const FILTER_OPS = {
+  text: [
+    { id: "contains", label: "contains", arity: 1 },
+    { id: "notContains", label: "does not contain", arity: 1 },
+    { id: "eq", label: "is", arity: 1 },
+    { id: "neq", label: "is not", arity: 1 },
+    { id: "startsWith", label: "starts with", arity: 1 },
+    { id: "endsWith", label: "ends with", arity: 1 },
+    { id: "empty", label: "is empty", arity: 0 },
+    { id: "notEmpty", label: "is not empty", arity: 0 },
+  ],
+  number: [
+    { id: "eq", label: "=", arity: 1 },
+    { id: "neq", label: "≠", arity: 1 },
+    { id: "gt", label: ">", arity: 1 },
+    { id: "gte", label: "≥", arity: 1 },
+    { id: "lt", label: "<", arity: 1 },
+    { id: "lte", label: "≤", arity: 1 },
+    { id: "between", label: "between", arity: 2 },
+    { id: "empty", label: "is empty", arity: 0 },
+    { id: "notEmpty", label: "is not empty", arity: 0 },
+  ],
+  date: [
+    { id: "on", label: "is", arity: 1 },
+    { id: "before", label: "before", arity: 1 },
+    { id: "after", label: "after", arity: 1 },
+    { id: "between", label: "between", arity: 2 },
+    { id: "empty", label: "is empty", arity: 0 },
+    { id: "notEmpty", label: "is not empty", arity: 0 },
+  ],
+  select: [
+    { id: "is", label: "is", arity: 1 },
+    { id: "isNot", label: "is not", arity: 1 },
+    { id: "empty", label: "is empty", arity: 0 },
+    { id: "notEmpty", label: "is not empty", arity: 0 },
+  ],
+  boolean: [
+    { id: "true", label: "is true", arity: 0 },
+    { id: "false", label: "is false", arity: 0 },
+  ],
+};
+
+const opsForType = (type) => FILTER_OPS[type] || FILTER_OPS.text;
+const opMeta = (type, opId) => opsForType(type).find((o) => o.id === opId) || opsForType(type)[0];
+
+// Raw (comparable) and string accessors for a cell.
+const rawFilterValue = (col, row) => (col.sortValue ? col.sortValue(row) : row[col.key]);
+const strFilterValue = (col, row) => {
+  const v = col.filterValue ? col.filterValue(row) : rawFilterValue(col, row);
+  return v == null ? "" : String(v);
+};
+
+// A column's filter data type: explicit `filterType`, else inferred from values.
+function resolveFilterType(col, data) {
+  if (col.filterType && FILTER_OPS[col.filterType]) return col.filterType;
+  for (const row of data) {
+    const v = rawFilterValue(col, row);
+    if (v == null || v === "") continue;
+    if (typeof v === "number") return "number";
+    if (typeof v === "boolean") return "boolean";
+    break;
+  }
+  return "text";
+}
+
+// A filter is "complete" (worth applying) once its operator has the values it needs.
+function isFilterComplete(type, f) {
+  const meta = opMeta(type, f.op);
+  if (meta.arity === 0) return true;
+  if (meta.arity === 1) return f.v1 != null && f.v1 !== "";
+  return f.v1 != null && f.v1 !== "" && f.v2 != null && f.v2 !== "";
+}
+
+const startOfDay = (d) => {
+  const x = new Date(d);
+  if (Number.isNaN(x.getTime())) return null;
+  x.setHours(0, 0, 0, 0);
+  return x.getTime();
+};
+
+// Evaluate one filter against one row.
+function rowMatchesFilter(col, type, f, row) {
+  const op = f.op;
+  const raw = col.filterValue ? col.filterValue(row) : rawFilterValue(col, row);
+  const isEmpty = raw == null || String(raw).trim() === "";
+  if (op === "empty") return isEmpty;
+  if (op === "notEmpty") return !isEmpty;
+
+  if (type === "boolean") {
+    const b = Boolean(rawFilterValue(col, row));
+    return op === "true" ? b : !b;
+  }
+
+  if (type === "number") {
+    const n = Number(rawFilterValue(col, row));
+    if (Number.isNaN(n)) return false;
+    const a = parseFloat(f.v1);
+    const b = parseFloat(f.v2);
+    switch (op) {
+      case "eq": return n === a;
+      case "neq": return n !== a;
+      case "gt": return n > a;
+      case "gte": return n >= a;
+      case "lt": return n < a;
+      case "lte": return n <= a;
+      case "between": return n >= Math.min(a, b) && n <= Math.max(a, b);
+      default: return true;
+    }
+  }
+
+  if (type === "date") {
+    const cell = startOfDay(Number(rawFilterValue(col, row)) || rawFilterValue(col, row));
+    if (cell == null) return false;
+    const a = f.v1 ? startOfDay(f.v1) : null;
+    const b = f.v2 ? startOfDay(f.v2) : null;
+    switch (op) {
+      case "on": return a != null && cell === a;
+      case "before": return a != null && cell < a;
+      case "after": return a != null && cell > a;
+      case "between": return a != null && b != null && cell >= Math.min(a, b) && cell <= Math.max(a, b);
+      default: return true;
+    }
+  }
+
+  // text + select
+  const cell = strFilterValue(col, row).toLowerCase();
+  const val = String(f.v1 ?? "").toLowerCase();
+  switch (op) {
+    case "contains": return cell.includes(val);
+    case "notContains": return !cell.includes(val);
+    case "eq":
+    case "is": return cell === val;
+    case "neq":
+    case "isNot": return cell !== val;
+    case "startsWith": return cell.startsWith(val);
+    case "endsWith": return cell.endsWith(val);
+    default: return true;
+  }
+}
+
+const newFilterId = () => Math.random().toString(36).slice(2, 9);
+
+// Popup query-builder. Edits a local draft; commits via onApply.
+function TableFilterModal({ columns, typeOf, optionsOf, initial, onApply, onClose }) {
+  const makeRow = () => {
+    const col = columns[0];
+    if (!col) return null;
+    const type = typeOf(col);
+    return { id: newFilterId(), key: col.key, op: opsForType(type)[0].id, v1: "", v2: "" };
+  };
+  // Open straight into one ready-to-fill row (no separate "add" step).
+  const [draft, setDraft] = useState(() =>
+    initial.length ? initial.map((f) => ({ ...f })) : [makeRow()].filter(Boolean),
+  );
+
+  const FIELD =
+    "rounded-md border border-[var(--color-border)] bg-[var(--color-panel-2)] px-2 py-1.5 text-sm text-zinc-200 focus:border-[var(--color-accent)] focus:outline-none";
+
+  const addRow = () => {
+    const row = makeRow();
+    if (row) setDraft((d) => [...d, row]);
+  };
+  const update = (id, patch) => setDraft((d) => d.map((f) => (f.id === id ? { ...f, ...patch } : f)));
+  const remove = (id) => setDraft((d) => d.filter((f) => f.id !== id));
+  const changeColumn = (id, key) => {
+    const col = columns.find((c) => c.key === key);
+    const type = typeOf(col);
+    update(id, { key, op: opsForType(type)[0].id, v1: "", v2: "" });
+  };
+
+  const valueInput = (f, type, which) => {
+    const k = which === 2 ? "v2" : "v1";
+    const inputType = type === "number" ? "number" : type === "date" ? "date" : "text";
+    if (type === "select") {
+      const options = optionsOf(columns.find((c) => c.key === f.key));
+      return (
+        <select className={FIELD} value={f[k]} onChange={(e) => update(f.id, { [k]: e.target.value })}>
+          <option value="">Select…</option>
+          {options.map((o) => (
+            <option key={o} value={o}>{o}</option>
+          ))}
+        </select>
+      );
+    }
+    return (
+      <input
+        type={inputType}
+        className={`${FIELD} min-w-0 flex-1`}
+        value={f[k]}
+        placeholder="Value"
+        onChange={(e) => update(f.id, { [k]: e.target.value })}
+      />
+    );
+  };
+
   return (
-    <div className="overflow-hidden rounded-xl border border-[var(--color-border)] bg-[var(--color-panel)]">
-      <table className="w-full text-sm">
-        <thead>
-          <tr className="text-left text-xs uppercase tracking-wide text-zinc-500">
-            {head.map((h, i) => (
-              <th key={i} className="px-4 py-3 font-medium">
-                {h}
-              </th>
-            ))}
-          </tr>
-        </thead>
-        <tbody>{children}</tbody>
-      </table>
+    <div
+      className="fixed inset-0 z-50 flex items-start justify-center overflow-y-auto bg-black/60 p-4 pt-16"
+      onClick={onClose}
+    >
+      <div
+        className="w-full max-w-2xl rounded-xl border border-[var(--color-border)] bg-[var(--color-panel)] p-5 shadow-xl"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="mb-4 flex items-center justify-between">
+          <h3 className="text-lg font-semibold">Filters</h3>
+          <button onClick={onClose} className="text-zinc-400 hover:text-zinc-200" aria-label="Close">×</button>
+        </div>
+
+        {draft.length === 0 ? (
+          <p className="rounded-lg border border-dashed border-[var(--color-border)] px-4 py-8 text-center text-sm text-zinc-500">
+            No filters yet. Add one to narrow the table.
+          </p>
+        ) : (
+          <div className="flex flex-col gap-2">
+            {draft.map((f) => {
+              const col = columns.find((c) => c.key === f.key) || columns[0];
+              const type = typeOf(col);
+              const meta = opMeta(type, f.op);
+              return (
+                <div key={f.id} className="flex flex-wrap items-center gap-2">
+                  <select className={FIELD} value={f.key} onChange={(e) => changeColumn(f.id, e.target.value)}>
+                    {columns.map((c) => (
+                      <option key={c.key} value={c.key}>{c.header}</option>
+                    ))}
+                  </select>
+                  <select className={FIELD} value={f.op} onChange={(e) => update(f.id, { op: e.target.value, v1: "", v2: "" })}>
+                    {opsForType(type).map((o) => (
+                      <option key={o.id} value={o.id}>{o.label}</option>
+                    ))}
+                  </select>
+                  {meta.arity >= 1 && valueInput(f, type, 1)}
+                  {meta.arity === 2 && (
+                    <>
+                      <span className="text-xs text-zinc-500">and</span>
+                      {valueInput(f, type, 2)}
+                    </>
+                  )}
+                  <button
+                    onClick={() => remove(f.id)}
+                    className="ml-auto flex h-7 w-7 items-center justify-center rounded-md text-zinc-500 hover:bg-[var(--color-panel-2)] hover:text-rose-300"
+                    aria-label="Remove filter"
+                  >
+                    ×
+                  </button>
+                </div>
+              );
+            })}
+          </div>
+        )}
+
+        <button
+          onClick={addRow}
+          className="mt-3 inline-flex items-center gap-1.5 rounded-md border border-[var(--color-border)] bg-[var(--color-panel-2)] px-2.5 py-1.5 text-xs text-zinc-300 hover:bg-[#242838]"
+        >
+          <FunnelIcon /> Add filter
+        </button>
+
+        <div className="mt-5 flex items-center justify-between">
+          <button onClick={() => setDraft([])} className="text-sm text-zinc-400 hover:text-zinc-200">
+            Clear all
+          </button>
+          <div className="flex gap-2">
+            <button
+              onClick={onClose}
+              className="rounded-lg border border-[var(--color-border)] bg-[var(--color-panel-2)] px-4 py-2 text-sm text-zinc-200 hover:bg-[#242838]"
+            >
+              Cancel
+            </button>
+            <button
+              onClick={() => onApply(draft)}
+              className="rounded-lg bg-[var(--color-accent)] px-4 py-2 text-sm font-semibold text-black"
+            >
+              Apply
+            </button>
+          </div>
+        </div>
+      </div>
     </div>
   );
 }
 
-function Td({ children, className = "" }) {
-  return <td className={`px-4 py-3 ${className}`}>{children}</td>;
+function DataTable({
+  columns,
+  data,
+  rowKey = (row) => row.id,
+  onRowClick,
+  storageKey,
+  initialPageSize = 25,
+}) {
+  const prefs = useMemo(() => loadTablePrefs(storageKey), [storageKey]);
+  const [sort, setSort] = useState(prefs.sort || null); // { key, dir: "asc" | "desc" }
+  const [hidden, setHidden] = useState(() => new Set(prefs.hidden || []));
+  const [pageSize, setPageSize] = useState(prefs.pageSize || initialPageSize);
+  const [page, setPage] = useState(0);
+  const [menuOpen, setMenuOpen] = useState(false);
+  const [filterModalOpen, setFilterModalOpen] = useState(false);
+  const [filters, setFilters] = useState([]); // [{ id, key, op, v1, v2 }]
+
+  useEffect(() => {
+    saveTablePrefs(storageKey, { sort, hidden: [...hidden], pageSize });
+  }, [storageKey, sort, hidden, pageSize]);
+
+  const visibleColumns = columns.filter((c) => !hidden.has(c.key));
+
+  // Columns that can be filtered + helpers the filter modal needs.
+  const filterableColumns = columns.filter((c) => c.header && c.filterable !== false);
+  const typeOf = (col) => resolveFilterType(col, data);
+  const optionsOf = (col) => {
+    const set = new Set();
+    for (const row of data) {
+      const s = strFilterValue(col, row).trim();
+      if (s) set.add(s);
+    }
+    return [...set].sort((a, b) => compareValues(a, b));
+  };
+
+  // Only filters whose operator has its required values actually constrain rows.
+  const activeFilters = filters.filter((f) => {
+    const col = columns.find((c) => c.key === f.key);
+    return col && isFilterComplete(typeOf(col), f);
+  });
+  const activeFilterCount = activeFilters.length;
+
+  // Reset to the first page whenever the active filters change.
+  useEffect(() => {
+    setPage(0);
+  }, [filters]);
+
+  const filteredData = useMemo(() => {
+    if (activeFilters.length === 0) return data;
+    return data.filter((row) =>
+      activeFilters.every((f) => {
+        const col = columns.find((c) => c.key === f.key);
+        if (!col) return true;
+        return rowMatchesFilter(col, resolveFilterType(col, data), f, row);
+      }),
+    );
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [data, filters, columns]);
+
+  const sortedData = useMemo(() => {
+    if (!sort) return filteredData;
+    const col = columns.find((c) => c.key === sort.key);
+    if (!col) return filteredData;
+    const valueOf = col.sortValue || ((row) => row[col.key]);
+    const arr = [...filteredData].sort((a, b) => compareValues(valueOf(a), valueOf(b)));
+    if (sort.dir === "desc") arr.reverse();
+    return arr;
+  }, [filteredData, sort, columns]);
+
+  const pageCount = Math.max(1, Math.ceil(sortedData.length / pageSize));
+  const currentPage = Math.min(page, pageCount - 1);
+  const start = currentPage * pageSize;
+  const pageData = sortedData.slice(start, start + pageSize);
+
+  function toggleSort(col) {
+    if (col.sortable === false) return;
+    setSort((prev) => {
+      if (!prev || prev.key !== col.key) return { key: col.key, dir: "asc" };
+      if (prev.dir === "asc") return { key: col.key, dir: "desc" };
+      return null; // third click clears the sort
+    });
+  }
+
+  function toggleColumn(key) {
+    setHidden((prev) => {
+      const next = new Set(prev);
+      next.has(key) ? next.delete(key) : next.add(key);
+      return next;
+    });
+  }
+
+  const alignClass = (a) => (a === "right" ? "text-right" : a === "center" ? "text-center" : "text-left");
+
+  return (
+    <div className="rounded-xl border border-[var(--color-border)] bg-[var(--color-panel)]">
+      <div className="flex items-center justify-between gap-2 rounded-t-xl border-b border-[var(--color-border)] px-3 py-2">
+        <span className="text-xs text-zinc-500">
+          {sortedData.length} {sortedData.length === 1 ? "row" : "rows"}
+        </span>
+        <div className="flex items-center gap-2">
+        {/* Filter by column (opens the query-builder popup) */}
+        <button
+          type="button"
+          title="Filter rows"
+          onClick={() => setFilterModalOpen(true)}
+          className={`flex h-7 items-center gap-1.5 rounded-md border px-2 text-xs hover:bg-[#242838] ${
+            activeFilterCount > 0
+              ? "border-[var(--color-accent)]/50 bg-[var(--color-accent)]/10 text-[var(--color-accent)]"
+              : "border-[var(--color-border)] bg-[var(--color-panel-2)] text-zinc-300"
+          }`}
+        >
+          <FunnelIcon />
+          Filter
+          {activeFilterCount > 0 && (
+            <span className="ml-0.5 rounded-full bg-[var(--color-accent)] px-1.5 text-[10px] font-semibold text-black">
+              {activeFilterCount}
+            </span>
+          )}
+        </button>
+
+        {/* Show / hide columns */}
+        <div className="relative">
+          <button
+            type="button"
+            title="Show / hide columns"
+            onClick={() => {
+              setMenuOpen((v) => !v);
+              setFilterOpen(false);
+            }}
+            className="flex h-7 w-7 items-center justify-center rounded-md border border-[var(--color-border)] bg-[var(--color-panel-2)] text-zinc-300 hover:bg-[#242838]"
+          >
+            <GearIcon />
+          </button>
+          {menuOpen && (
+            <>
+              <div className="fixed inset-0 z-20" onClick={() => setMenuOpen(false)} />
+              <div className="absolute right-0 z-30 mt-1 w-52 rounded-lg border border-[var(--color-border)] bg-[var(--color-panel)] p-1.5 shadow-xl">
+                <div className="px-2 py-1 text-[10px] font-semibold uppercase tracking-wide text-zinc-500">
+                  Columns
+                </div>
+                {columns
+                  .filter((c) => c.hideable !== false && c.header)
+                  .map((c) => (
+                    <label
+                      key={c.key}
+                      className="flex cursor-pointer items-center gap-2 rounded-md px-2 py-1.5 text-sm text-zinc-200 hover:bg-[var(--color-panel-2)]"
+                    >
+                      <input
+                        type="checkbox"
+                        checked={!hidden.has(c.key)}
+                        onChange={() => toggleColumn(c.key)}
+                        className="accent-[var(--color-accent)]"
+                      />
+                      {c.header}
+                    </label>
+                  ))}
+              </div>
+            </>
+          )}
+        </div>
+        </div>
+      </div>
+
+      {/* Mobile (< sm): each row as a stacked card so nothing is cut off. */}
+      <div className="divide-y divide-[var(--color-border)] sm:hidden">
+        {pageData.map((row) => {
+          const [first, ...rest] = visibleColumns;
+          return (
+            <div
+              key={rowKey(row)}
+              onClick={onRowClick ? () => onRowClick(row) : undefined}
+              className={`px-4 py-3 ${onRowClick ? "cursor-pointer active:bg-[var(--color-panel-2)]/40" : ""}`}
+            >
+              {first && (
+                <div className="mb-2 text-sm font-medium text-zinc-100">
+                  {first.render ? first.render(row) : row[first.key]}
+                </div>
+              )}
+              <dl className="flex flex-col gap-1.5">
+                {rest.map((c) => (
+                  <div key={c.key} className="flex items-center justify-between gap-3">
+                    <dt className="text-[11px] uppercase tracking-wide text-zinc-500">{c.header}</dt>
+                    <dd className="text-right text-sm text-zinc-300">
+                      {c.render ? c.render(row) : row[c.key]}
+                    </dd>
+                  </div>
+                ))}
+              </dl>
+            </div>
+          );
+        })}
+        {pageData.length === 0 && (
+          <div className="px-4 py-8 text-center text-sm text-zinc-500">No rows to show.</div>
+        )}
+      </div>
+
+      {/* Desktop (sm+): full table, horizontally scrollable if needed. */}
+      <div className="hidden overflow-x-auto sm:block">
+      <table className="w-full min-w-[560px] text-sm">
+        <thead>
+          <tr className="text-left text-xs uppercase tracking-wide text-zinc-500">
+            {visibleColumns.map((c) => {
+              const active = sort?.key === c.key;
+              const sortable = c.sortable !== false;
+              return (
+                <th
+                  key={c.key}
+                  onClick={() => toggleSort(c)}
+                  className={`px-4 py-3 font-medium ${alignClass(c.align)} ${
+                    sortable ? "cursor-pointer select-none hover:text-zinc-300" : ""
+                  } ${c.thClassName || ""}`}
+                >
+                  <span className="inline-flex items-center gap-1">
+                    {c.header}
+                    {sortable && c.header && (
+                      <SortIndicator dir={active ? sort.dir : null} />
+                    )}
+                  </span>
+                </th>
+              );
+            })}
+          </tr>
+        </thead>
+        <tbody>
+          {pageData.map((row) => (
+            <tr
+              key={rowKey(row)}
+              onClick={onRowClick ? () => onRowClick(row) : undefined}
+              className={`border-t border-[var(--color-border)] ${
+                onRowClick ? "cursor-pointer hover:bg-[var(--color-panel-2)]/40" : ""
+              }`}
+            >
+              {visibleColumns.map((c) => (
+                <td key={c.key} className={`px-4 py-3 ${alignClass(c.align)} ${c.tdClassName || ""}`}>
+                  {c.render ? c.render(row) : row[c.key]}
+                </td>
+              ))}
+            </tr>
+          ))}
+          {pageData.length === 0 && (
+            <tr>
+              <td colSpan={visibleColumns.length} className="px-4 py-8 text-center text-sm text-zinc-500">
+                No rows to show.
+              </td>
+            </tr>
+          )}
+        </tbody>
+      </table>
+      </div>
+
+      <div className="flex flex-wrap items-center justify-between gap-3 rounded-b-xl border-t border-[var(--color-border)] px-3 py-2 text-xs text-zinc-400">
+        <div className="flex items-center gap-2">
+          <span>Rows per page</span>
+          <select
+            value={pageSize}
+            onChange={(e) => {
+              setPageSize(Number(e.target.value));
+              setPage(0);
+            }}
+            className="rounded-md border border-[var(--color-border)] bg-[var(--color-panel-2)] px-2 py-1 text-zinc-200 focus:outline-none"
+          >
+            {PAGE_SIZE_OPTIONS.map((n) => (
+              <option key={n} value={n}>
+                {n}
+              </option>
+            ))}
+          </select>
+        </div>
+        <div className="inline-flex items-center overflow-hidden rounded-lg border border-[var(--color-border)] bg-[var(--color-panel-2)]">
+          <button
+            type="button"
+            onClick={() => setPage((p) => Math.max(0, p - 1))}
+            disabled={currentPage === 0}
+            aria-label="Previous page"
+            className="flex h-8 w-9 items-center justify-center text-base text-blue-500 hover:bg-[#242838] disabled:text-zinc-600 disabled:hover:bg-transparent"
+          >
+            ‹
+          </button>
+          <span className="min-w-[4.5rem] px-2 text-center text-sm font-medium tabular-nums text-zinc-200">
+            {sortedData.length === 0 ? 0 : start + 1} - {Math.min(start + pageSize, sortedData.length)}
+          </span>
+          <button
+            type="button"
+            onClick={() => setPage((p) => Math.min(pageCount - 1, p + 1))}
+            disabled={currentPage >= pageCount - 1}
+            aria-label="Next page"
+            className="flex h-8 w-9 items-center justify-center text-base text-blue-500 hover:bg-[#242838] disabled:text-zinc-600 disabled:hover:bg-transparent"
+          >
+            ›
+          </button>
+        </div>
+      </div>
+
+      {filterModalOpen && (
+        <TableFilterModal
+          columns={filterableColumns}
+          typeOf={typeOf}
+          optionsOf={optionsOf}
+          initial={filters}
+          onApply={(next) => {
+            setFilters(next);
+            setFilterModalOpen(false);
+          }}
+          onClose={() => setFilterModalOpen(false)}
+        />
+      )}
+    </div>
+  );
+}
+
+function SortIndicator({ dir }) {
+  return (
+    <span className={`text-[10px] ${dir ? "text-[var(--color-accent)]" : "text-zinc-600"}`}>
+      {dir === "asc" ? "▲" : dir === "desc" ? "▼" : "↕"}
+    </span>
+  );
+}
+
+function FunnelIcon() {
+  return (
+    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3" />
+    </svg>
+  );
+}
+
+function GearIcon() {
+  return (
+    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <circle cx="12" cy="12" r="3" />
+      <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z" />
+    </svg>
+  );
 }
 
 function RowActions({ onOpen, onDelete }) {
@@ -1968,6 +4004,436 @@ function SaveIndicator({ saveState, livePing }) {
   );
 }
 
+// Per-country pricing status pill. "Live" once a story is published AND priced;
+// "Waiting for price" when no usable price; "Priced · draft" when priced but the
+// story itself isn't published yet.
+function PriceStatusPill({ eff, published }) {
+  if (!eff) {
+    return (
+      <span className="inline-flex items-center gap-1.5 rounded-full border border-amber-400/40 bg-amber-400/10 px-2.5 py-0.5 text-xs font-medium text-amber-200">
+        <span className="h-1.5 w-1.5 rounded-full bg-amber-300" />
+        Waiting for price
+      </span>
+    );
+  }
+  if (!published) {
+    return (
+      <span className="inline-flex items-center gap-1.5 rounded-full border border-[var(--color-border)] bg-[var(--color-panel-2)] px-2.5 py-0.5 text-xs font-medium text-zinc-300">
+        <span className="h-1.5 w-1.5 rounded-full bg-zinc-400" />
+        Priced · draft
+      </span>
+    );
+  }
+  return (
+    <span className="inline-flex items-center gap-1.5 rounded-full border border-emerald-400/40 bg-emerald-400/10 px-2.5 py-0.5 text-xs font-medium text-emerald-200">
+      <span className="h-1.5 w-1.5 rounded-full bg-emerald-300" />
+      Live
+    </span>
+  );
+}
+
+// The raw price / discount strings stored for one country (handles the legacy
+// numeric shape as well as the current { price, discountPrice } object).
+function rawPriceFields(entry) {
+  if (entry == null) return { price: "", discount: "" };
+  if (typeof entry === "number") return { price: entry > 0 ? String(entry) : "", discount: "" };
+  return {
+    price: entry.price != null ? String(entry.price) : "",
+    discount: entry.discountPrice != null ? String(entry.discountPrice) : "",
+  };
+}
+
+// Human-readable per-country price status (used for the table's select filter).
+function priceStatusLabel(entry, published) {
+  if (!effectivePrice(entry)) return "Waiting for price";
+  return published ? "Live" : "Priced · draft";
+}
+
+// Pricing list — same DataTable component as Stories. Click a row to open its
+// price detail. Columns adapt to context: a specific header country shows that
+// market's price + status; "All" shows how many of the viewer's markets are
+// priced. Members only ever see their own countries (server enforces this too).
+function PricingTable({ rows = [], myCountries = [], country, isAdmin, onOpen }) {
+  const specific = country && country !== "all" ? myCountries.find((c) => c.code === country) : null;
+  const countPriced = (s) => myCountries.filter((c) => effectivePrice(s.prices?.[c.code])).length;
+
+  const columns = [
+    {
+      key: "title",
+      header: "Title",
+      hideable: false,
+      filterType: "text",
+      sortValue: (s) => s.title,
+      render: (s) => <span className="font-medium text-zinc-100">{s.title}</span>,
+    },
+    {
+      key: "status",
+      header: "Status",
+      filterType: "select",
+      sortValue: (s) => s.status,
+      filterValue: (s) => (s.status === "published" ? "Published" : "Draft"),
+      render: (s) => <StatusPill status={s.status} />,
+    },
+  ];
+
+  if (specific) {
+    columns.push(
+      {
+        key: "price",
+        header: `Price (${specific.currency})`,
+        align: "right",
+        filterType: "number",
+        sortValue: (s) => effectivePrice(s.prices?.[specific.code])?.effective ?? -1,
+        render: (s) => {
+          const eff = effectivePrice(s.prices?.[specific.code]);
+          if (!eff) return <span className="text-amber-400/80">—</span>;
+          return (
+            <span className="tabular-nums text-zinc-200">
+              {formatMoney(eff.effective, specific.currency)}
+              {eff.discountPrice != null && (
+                <span className="ml-1 text-[11px] text-zinc-500 line-through">
+                  {formatMoney(eff.price, specific.currency)}
+                </span>
+              )}
+            </span>
+          );
+        },
+      },
+      {
+        key: "pstatus",
+        header: "Pricing",
+        filterType: "select",
+        sortValue: (s) => priceStatusLabel(s.prices?.[specific.code], s.status === "published"),
+        filterValue: (s) => priceStatusLabel(s.prices?.[specific.code], s.status === "published"),
+        render: (s) => (
+          <PriceStatusPill
+            eff={effectivePrice(s.prices?.[specific.code])}
+            published={s.status === "published"}
+          />
+        ),
+      }
+    );
+  } else {
+    columns.push({
+      key: "priced",
+      header: isAdmin ? "Priced markets" : "Pricing",
+      align: "right",
+      filterType: "number",
+      sortValue: (s) => countPriced(s),
+      render: (s) => {
+        const n = countPriced(s);
+        const total = myCountries.length;
+        if (n === 0) return <span className="text-amber-400/80">Waiting</span>;
+        return (
+          <span className="tabular-nums text-zinc-300">
+            {n}/{total} priced
+          </span>
+        );
+      },
+    });
+  }
+
+  return (
+    <>
+      <PageHeader
+        title="Pricing"
+        subtitle={
+          specific
+            ? `Editing ${specific.flag} ${specific.name} (${specific.currency}). Open a story to set its price.`
+            : "Open a story to set its price per country."
+        }
+      />
+      {rows.length === 0 ? (
+        <EmptyTable text="No stories yet. Create a story first, then price it here." />
+      ) : (
+        <DataTable
+          storageKey="pricing"
+          columns={columns}
+          data={rows}
+          rowKey={(s) => s.id}
+          onRowClick={(s) => onOpen(s.id)}
+        />
+      )}
+    </>
+  );
+}
+
+// One country's editable price card (regular + discounted), with a live tax/total
+// preview and per-country save.
+function PricingCountryEditor({ row, rec, onSave, onError }) {
+  const entry = row.prices?.[rec.code];
+  const init = rawPriceFields(entry);
+  const [price, setPrice] = useState(init.price);
+  const [discount, setDiscount] = useState(init.discount);
+  const [saving, setSaving] = useState(false);
+
+  useEffect(() => {
+    const f = rawPriceFields(entry);
+    setPrice(f.price);
+    setDiscount(f.discount);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [row.id, rec.code, JSON.stringify(entry)]);
+
+  const step = 1 / 10 ** currencyDecimals(rec.currency);
+  const priceNum = Number(price);
+  const discNum = Number(discount);
+  const hasPrice = price !== "" && Number.isFinite(priceNum) && priceNum > 0;
+  const hasDiscount = discount !== "" && Number.isFinite(discNum) && discNum > 0;
+  const badDiscount = hasDiscount && (!hasPrice || discNum >= priceNum);
+
+  const eff = effectivePrice(
+    hasPrice ? { price: priceNum, discountPrice: hasDiscount ? discNum : null } : null
+  );
+  const preview = eff ? computeOrderPricing(eff.effective, rec) : null;
+  const dirty = price !== init.price || discount !== init.discount;
+
+  async function save() {
+    if (badDiscount) return;
+    setSaving(true);
+    try {
+      await onSave(row.id, {
+        country: rec.code,
+        price: hasPrice ? priceNum : "",
+        discountPrice: hasDiscount ? discNum : "",
+      });
+    } catch (e) {
+      onError?.(e.message);
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <div className="rounded-lg border border-[var(--color-border)] bg-[var(--color-panel-2)] p-4">
+      <div className="mb-3 flex items-center justify-between gap-2">
+        <span className="font-medium text-zinc-100">
+          {rec.flag} {rec.name}
+        </span>
+        <PriceStatusPill eff={effectivePrice(entry)} published={row.status === "published"} />
+      </div>
+      <div className="flex flex-wrap items-end gap-3">
+        <label className="block">
+          <span className="mb-0.5 block text-[10px] uppercase tracking-wide text-zinc-500">
+            Price ({rec.currency})
+          </span>
+          <input
+            type="number"
+            min="0"
+            step={step}
+            value={price}
+            onChange={(e) => setPrice(e.target.value)}
+            placeholder="0"
+            className="w-32 rounded-md border border-[var(--color-border)] bg-[var(--color-panel)] px-3 py-2 text-sm tabular-nums focus:border-[var(--color-accent)] focus:outline-none"
+          />
+        </label>
+        <label className="block">
+          <span className="mb-0.5 block text-[10px] uppercase tracking-wide text-zinc-500">
+            Discounted
+          </span>
+          <input
+            type="number"
+            min="0"
+            step={step}
+            value={discount}
+            onChange={(e) => setDiscount(e.target.value)}
+            placeholder="—"
+            className={`w-32 rounded-md border bg-[var(--color-panel)] px-3 py-2 text-sm tabular-nums focus:outline-none ${
+              badDiscount
+                ? "border-rose-500/60 focus:border-rose-500"
+                : "border-[var(--color-border)] focus:border-[var(--color-accent)]"
+            }`}
+          />
+        </label>
+        <button
+          onClick={save}
+          disabled={!dirty || saving || badDiscount}
+          className="rounded-md bg-[var(--color-accent)] px-4 py-2 text-sm font-semibold text-black disabled:cursor-not-allowed disabled:opacity-40"
+        >
+          {saving ? "Saving…" : "Save"}
+        </button>
+      </div>
+      {preview && preview.taxEnabled && (
+        <p className="mt-2 text-[11px] text-zinc-500">
+          {preview.taxInclusive ? "incl." : "+"} {preview.taxLabel} {preview.taxRate}% →{" "}
+          {formatMoney(preview.total, rec.currency)} total
+          {eff.discountPrice != null && (
+            <span className="ml-1 line-through">{formatMoney(eff.price, rec.currency)}</span>
+          )}
+        </p>
+      )}
+      {badDiscount && (
+        <p className="mt-2 text-[11px] text-rose-400">
+          Discounted price must be below the regular price.
+        </p>
+      )}
+    </div>
+  );
+}
+
+// Price detail for one story. Admins edit every market; members only see + edit
+// the countries they're assigned to ("based on the country he is in").
+function PricingDetail({ row, countries = [], myCountries = [], isAdmin, onBack, onSave, onError }) {
+  if (!row) {
+    return (
+      <>
+        <BackButton onClick={onBack} />
+        <div className="rounded-xl border border-[var(--color-border)] bg-[var(--color-panel)] p-8 text-center text-sm text-zinc-500">
+          This story is no longer available.
+        </div>
+      </>
+    );
+  }
+
+  // Admins price every enabled market; members are scoped to their own.
+  const editable = isAdmin ? enabledCountries(countries) : myCountries;
+
+  return (
+    <>
+      <BackButton onClick={onBack} />
+      <header className="mb-6">
+        <div className="flex flex-wrap items-center gap-3">
+          <h1 className="text-2xl font-semibold text-zinc-100">{row.title}</h1>
+          <StatusPill status={row.status} />
+        </div>
+        <p className="mt-1 text-sm text-zinc-400">
+          {isAdmin
+            ? "Set the price (and optional discounted price) for each market. "
+            : "Set the price (and optional discounted price) for your market. "}
+          A market with no price is{" "}
+          <span className="text-amber-300">waiting for price</span> and won't go live there.
+        </p>
+      </header>
+
+      {editable.length === 0 ? (
+        <div className="rounded-xl border border-[var(--color-border)] bg-[var(--color-panel)] p-8 text-center text-sm text-zinc-500">
+          No countries assigned to you. Ask an admin to grant a market in Access.
+        </div>
+      ) : (
+        <div className="grid gap-3 sm:grid-cols-2">
+          {editable.map((rec) => (
+            <PricingCountryEditor
+              key={rec.code}
+              row={row}
+              rec={rec}
+              onSave={onSave}
+              onError={onError}
+            />
+          ))}
+        </div>
+      )}
+    </>
+  );
+}
+
+// The story's cast: the children it features. One character by default; add more
+// for multi-kid stories, then pin each to a face slot per scene in the editor.
+const GENDER_OPTS = [
+  { id: "female", label: "Girl" },
+  { id: "male", label: "Boy" },
+  { id: "non-binary", label: "Child" },
+];
+
+function CastEditor({ characters = [], onSave }) {
+  const [draft, setDraft] = useState(characters);
+  const [saving, setSaving] = useState(false);
+
+  useEffect(() => {
+    setDraft(characters);
+  }, [JSON.stringify(characters)]);
+
+  const dirty = JSON.stringify(draft) !== JSON.stringify(characters);
+  const multi = draft.length > 1;
+
+  function patch(i, p) {
+    setDraft((d) => d.map((c, idx) => (idx === i ? { ...c, ...p } : c)));
+  }
+  function add() {
+    setDraft((d) => [
+      ...d,
+      { id: `new-${nid()}`, key: `child${d.length + 1}`, label: `Child ${d.length + 1}`, gender: "female" },
+    ]);
+  }
+  function remove(i) {
+    setDraft((d) => d.filter((_, idx) => idx !== i));
+  }
+  async function save() {
+    setSaving(true);
+    try {
+      await onSave(draft);
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <div className="mb-4 rounded-lg border border-[var(--color-border)] bg-[var(--color-panel-2)] p-3">
+      <div className="mb-2 flex items-center justify-between">
+        <span className="text-xs uppercase tracking-wide text-zinc-500">
+          Cast {multi ? `· ${draft.length} children` : ""}
+        </span>
+        <button
+          type="button"
+          onClick={add}
+          className="rounded-md border border-[var(--color-border)] bg-[var(--color-panel)] px-2.5 py-1 text-xs font-medium text-zinc-300 hover:bg-[#242838]"
+        >
+          + Add child
+        </button>
+      </div>
+      <div className="space-y-2">
+        {draft.map((c, i) => (
+          <div key={c.id} className="flex flex-wrap items-center gap-2">
+            {multi && (
+              <input
+                value={c.label}
+                onChange={(e) => patch(i, { label: e.target.value })}
+                placeholder={`Child ${i + 1}`}
+                className="w-40 rounded-md border border-[var(--color-border)] bg-[var(--color-panel)] px-3 py-1.5 text-sm focus:border-[var(--color-accent)] focus:outline-none"
+              />
+            )}
+            <div className="flex gap-1 rounded-md border border-[var(--color-border)] bg-[var(--color-panel)] p-1">
+              {GENDER_OPTS.map((g) => (
+                <button
+                  key={g.id}
+                  type="button"
+                  onClick={() => patch(i, { gender: g.id })}
+                  className={`rounded px-3 py-1 text-xs font-medium transition ${
+                    (c.gender || "female") === g.id
+                      ? "bg-[var(--color-accent)] text-black"
+                      : "text-zinc-400 hover:text-zinc-200"
+                  }`}
+                >
+                  {g.label}
+                </button>
+              ))}
+            </div>
+            {multi && (
+              <button
+                type="button"
+                onClick={() => remove(i)}
+                title="Remove child"
+                className="rounded-md border border-[var(--color-border)] px-2 py-1.5 text-xs text-zinc-500 hover:bg-rose-600/20 hover:text-rose-200"
+              >
+                ✕
+              </button>
+            )}
+          </div>
+        ))}
+      </div>
+      {dirty && (
+        <div className="mt-3">
+          <button
+            onClick={save}
+            disabled={saving || draft.length === 0}
+            className="rounded-md bg-[var(--color-accent)] px-4 py-1.5 text-xs font-semibold text-black disabled:cursor-not-allowed disabled:opacity-40"
+          >
+            {saving ? "Saving…" : "Save cast"}
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function StoryDetail({
   story,
   variables,
@@ -1975,6 +4441,7 @@ function StoryDetail({
   onAddCell,
   onSaveTitle,
   onSaveGender,
+  onSaveCharacters,
   onUploadCellImage,
   onUploadCellBackground,
   onRemoveCellBackground,
@@ -2067,28 +4534,41 @@ function StoryDetail({
         <StatusPill status={story.status} />
         <SaveIndicator saveState={saveState} livePing={livePing} />
       </PageHeader>
-      <div className="mb-4 flex items-center gap-3">
-        <span className="text-xs uppercase tracking-wide text-zinc-500">Child</span>
-        <div className="flex gap-1 rounded-md border border-[var(--color-border)] bg-[var(--color-panel-2)] p-1">
-          {[
-            { id: "female", label: "Girl" },
-            { id: "male", label: "Boy" },
-          ].map((g) => (
-            <button
-              key={g.id}
-              type="button"
-              onClick={() => onSaveGender(g.id)}
-              className={`rounded px-4 py-1 text-xs font-medium transition ${
-                (story.gender || "female") === g.id
-                  ? "bg-[var(--color-accent)] text-black"
-                  : "text-zinc-400 hover:text-zinc-200"
-              }`}
-            >
-              {g.label}
-            </button>
-          ))}
-        </div>
-      </div>
+      <CastEditor
+        characters={story.characters || []}
+        onSave={onSaveCharacters}
+        onSaveGender={onSaveGender}
+      />
+      {(() => {
+        const chars = story.characters || [];
+        if (chars.length <= 1) return null;
+        const warns = [];
+        const slotCharIds = new Set();
+        (story.scenes || []).forEach((sc) =>
+          (sc.kidSlots || []).forEach((k) => k.characterId && slotCharIds.add(k.characterId))
+        );
+        const validIds = new Set(chars.map((c) => c.id));
+        chars.forEach((c) => {
+          if (!slotCharIds.has(c.id)) warns.push(`“${c.label}” has no face slot on any page.`);
+        });
+        (story.scenes || []).forEach((sc, i) =>
+          (sc.kidSlots || []).forEach((k) => {
+            if (!k.characterId || !validIds.has(k.characterId))
+              warns.push(`A face slot on page ${i + 1} isn't assigned to a child.`);
+          })
+        );
+        if (!warns.length) return null;
+        return (
+          <div className="mb-4 rounded-lg border border-amber-400/30 bg-amber-400/5 p-3 text-xs text-amber-200">
+            <div className="mb-1 font-semibold">Cast setup needs attention</div>
+            <ul className="list-inside list-disc space-y-0.5">
+              {warns.map((w, i) => (
+                <li key={i}>{w}</li>
+              ))}
+            </ul>
+          </div>
+        );
+      })()}
       <Section step="" title="Book layout">
         <div className="mb-4 flex w-full max-w-xs gap-1 rounded-md border border-[var(--color-border)] bg-[var(--color-panel-2)] p-1">
           {[
@@ -2132,7 +4612,7 @@ function StoryDetail({
             onClick={() => onAddCell(bookLang)}
             className="rounded-md border border-[var(--color-border)] bg-[var(--color-panel-2)] px-3 py-1.5 text-xs font-medium hover:bg-[#242838]"
           >
-            + Add cell
+            + Add page
           </button>
           {otherLangCount > 0 && (
             <button
@@ -2171,6 +4651,7 @@ function StoryDetail({
               aspect={story.aspect || "3:4"}
               variables={variables}
               cellBusy={cellBusy}
+              rtl={isRtl}
               onUploadImage={onUploadCellImage}
               onUploadBackground={onUploadCellBackground}
               onRemoveBackground={onRemoveCellBackground}
@@ -2873,6 +5354,7 @@ function CellBook({
   aspect,
   variables,
   cellBusy,
+  rtl = false,
   onUploadImage,
   onUploadBackground,
   onRemoveBackground,
@@ -2884,7 +5366,8 @@ function CellBook({
 }) {
   const [dragId, setDragId] = useState(null);
   const [overId, setOverId] = useState(null);
-  const ratio = (aspect || "3:4").replace(":", " / ");
+  // Every page is the printing press's Page Area sheet (10629.9 × 7559.1 px).
+  const ratio = PAGE_AREA_RATIO_CSS;
 
   function moveBefore(targetId) {
     if (!dragId || dragId === targetId) return;
@@ -2917,51 +5400,36 @@ function CellBook({
     },
   });
 
-  const page = (cell, label) => (
-    <Cell
-      cell={cell}
-      ratio={ratio}
-      label={label}
-      variables={variables}
-      busy={!!cellBusy[cell.id]}
-      onUploadImage={onUploadImage}
-      onUploadBackground={onUploadBackground}
-      onRemoveBackground={onRemoveBackground}
-      onSaveText={onSaveText}
-      onOpenEditor={onOpenEditor}
-      onDelete={onDelete}
-      onSetCellScoring={onSetCellScoring}
-      {...dragProps(cell.id)}
-    />
-  );
-
-  // Cover (1, alone right) · middle spreads (2) · back cover (1, alone left).
-  const rows = buildBookRows(cells);
-
+  // Each page IS one printed sheet — two book pages the press prints together
+  // (left + right halves). The first sheet is the cover wrap: back cover on the
+  // left, front cover on the right.
   return (
     <div className="space-y-4">
-      {rows.map((row) => {
-        if (row.kind === "cover") {
-          return (
-            <Spread key={row.cell.id}>
-              <div className="hidden sm:block" />
-              {page(row.cell, row.label)}
-            </Spread>
-          );
-        }
-        if (row.kind === "back") {
-          return (
-            <Spread key={row.cell.id}>
-              {page(row.cell, row.label)}
-              <div className="hidden sm:block" />
-            </Spread>
-          );
-        }
+      {cells.map((cell, i) => {
+        const isCover = i === 0;
+        // Semantic sides (same data model in both languages): the RIGHT side is
+        // the front cover / odd page; the LEFT side is the back cover / even page.
+        const leftLabel = isCover ? "Back cover" : `Page ${i * 2}`;
+        const rightLabel = isCover ? "Front cover" : `Page ${i * 2 + 1}`;
         return (
-          <Spread key={row.cells[0].id + (row.cells[1]?.id || "")}>
-            {page(row.cells[0], row.labels[0])}
-            {row.cells[1] ? page(row.cells[1], row.labels[1]) : <div className="hidden sm:block" />}
-          </Spread>
+          <Cell
+            key={cell.id}
+            cell={cell}
+            ratio={ratio}
+            leftLabel={leftLabel}
+            rightLabel={rightLabel}
+            mirror={rtl}
+            variables={variables}
+            busy={!!cellBusy[cell.id]}
+            onUploadImage={onUploadImage}
+            onUploadBackground={onUploadBackground}
+            onRemoveBackground={onRemoveBackground}
+            onSaveText={onSaveText}
+            onOpenEditor={onOpenEditor}
+            onDelete={onDelete}
+            onSetCellScoring={onSetCellScoring}
+            {...dragProps(cell.id)}
+          />
         );
       })}
     </div>
@@ -3236,17 +5704,38 @@ function TextToolbar({ style, setS }) {
 
 const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
 
-function ratioNums(aspect) {
-  const [w, h] = (aspect || "3:4").split(":").map(Number);
-  return [w || 3, h || 4];
+// Apply {{tokens}} → values for read-only rendering (orders).
+// `names` (optional) maps a character key -> { name, nameAr } for the
+// {{name:<key>}} / {{nameAr:<key>}} tokens; `names.__primary__` lets the legacy
+// {{Child_Name}} fall back to the primary child's name. Mirrors server applyVars.
+function applyVarsClient(text, values, names) {
+  if (!text) return "";
+  let out = text;
+  if (names) {
+    out = out.replace(/\{\{\s*(name|nameAr)\s*:\s*([A-Za-z0-9_]+)\s*\}\}/g, (m, kind, key) => {
+      const rec = names[key];
+      const v = rec && (kind === "nameAr" ? rec.nameAr : rec.name);
+      return v != null && v !== "" ? v : m;
+    });
+  }
+  out = out.replace(/\{\{\s*([A-Za-z0-9_]+)\s*\}\}/g, (m, name) => {
+    let v = values && values[name];
+    if ((v == null || v === "") && name === "Child_Name" && names?.__primary__) v = names.__primary__.name;
+    return v != null && v !== "" ? v : m;
+  });
+  return out;
 }
 
-// Apply {{tokens}} → values for read-only rendering (orders).
-function applyVarsClient(text, values) {
-  if (!text) return "";
-  return text.replace(/\{\{\s*([A-Za-z0-9_]+)\s*\}\}/g, (m, name) =>
-    values && values[name] != null && values[name] !== "" ? values[name] : m
-  );
+// Build the per-character name map an order needs for applyVarsClient.
+function orderNameMap(order) {
+  const names = {};
+  const chars = order?.characters || [];
+  for (const c of chars) {
+    const k = order?.kids?.[c.id] || (c.id === chars[0]?.id ? order?.kid : null);
+    names[c.key] = { name: k?.name || "", nameAr: k?.nameAr || "" };
+  }
+  names.__primary__ = chars[0] ? names[chars[0].key] : null;
+  return names;
 }
 
 // A blank text layer dropped at the center of the page.
@@ -3397,6 +5886,57 @@ function cellLayers(cell) {
   return [];
 }
 
+// ── Per-side design model ────────────────────────────────────────────────────
+// Each page (sheet) holds two independent designs — a LEFT and a RIGHT side —
+// the press prints together. Each side owns its own background, content, kid
+// slots, safe zones and AI prompt: one square Design Area apiece.
+const DEFAULT_SIDE_BG = "#faf7ef";
+
+function emptySide() {
+  return {
+    elements: [],
+    bgUrl: null,
+    bgFalUrl: null,
+    bgColor: DEFAULT_SIDE_BG,
+    bgBlur: 0,
+    kidSlots: [],
+    safeZones: [],
+    aiPrompt: "",
+  };
+}
+
+// Pull a legacy single-design cell into one side object. cellLayers() also
+// covers legacy image/text cells (not yet migrated to elements).
+function legacyToSide(cell) {
+  return {
+    elements: cellLayers(cell),
+    bgUrl: cell?.bgUrl || null,
+    bgFalUrl: cell?.bgFalUrl || null,
+    bgColor: cell?.bgColor || DEFAULT_SIDE_BG,
+    bgBlur: cell?.bgBlur || 0,
+    kidSlots: Array.isArray(cell?.kidSlots) ? cell.kidSlots : [],
+    safeZones: Array.isArray(cell?.safeZones) ? cell.safeZones : [],
+    aiPrompt: cell?.aiPrompt || "",
+  };
+}
+
+// Normalize a cell into { left, right } sides, migrating legacy single-design
+// cells: the old whole-cell design becomes the RIGHT side (front cover / right
+// page), and the LEFT side starts empty.
+function getSides(cell) {
+  if (cell?.sides && cell.sides.left && cell.sides.right) {
+    return {
+      left: { ...emptySide(), ...cell.sides.left },
+      right: { ...emptySide(), ...cell.sides.right },
+    };
+  }
+  const hasLegacy =
+    cellLayers(cell).length > 0 ||
+    !!cell?.bgUrl ||
+    (typeof cell?.bgColor === "string" && cell.bgColor !== DEFAULT_SIDE_BG);
+  return { left: emptySide(), right: hasLegacy ? legacyToSide(cell) : emptySide() };
+}
+
 function elementTextCss(el) {
   return {
     fontSize: `${el.fontSizePct || 6}cqh`,
@@ -3413,9 +5953,246 @@ function elementTextCss(el) {
   };
 }
 
+// CSS box for a print-spec rectangle (percent of the Page Area canvas).
+function rectStyle(r, extra) {
+  return {
+    position: "absolute",
+    left: `${r.leftPct}%`,
+    top: `${r.topPct}%`,
+    width: `${r.widthPct}%`,
+    height: `${r.heightPct}%`,
+    ...extra,
+  };
+}
+
+// Visual guides for the printing-press geometry, nested on the Page Area canvas:
+//   • Print Size — the inked region, split into a left/right half. Each half can
+//     hold a color or a stretched image (tinted here so it's visible).
+//   • Design Area — the two safe 4962.5² squares, side by side (bold borders).
+// Pointer-events-none and editor-only: never part of the printed output.
+function PrintSpecGuides({ solid = false }) {
+  return (
+    <div className="pointer-events-none absolute inset-0 z-[6000]" aria-hidden>
+      {/* Page Area — the full sheet (this whole canvas). Only filled in `solid`
+          mode; otherwise outline-only so the design shows through. */}
+      <div
+        className="absolute inset-0"
+        style={{ background: solid ? "#ffffff" : undefined, outline: "2px solid rgba(255,255,255,0.7)" }}
+      >
+        <span className="absolute bottom-1 right-1 bg-white px-1 text-[9px] font-semibold text-black">
+          Page area
+        </span>
+      </div>
+      {/* Print Size halves — the color / stretched-image region. */}
+      <div
+        style={rectStyle(PRINT_LEFT_RECT, {
+          background: solid ? "rgba(132,204,22,0.16)" : undefined,
+          outline: "1px dashed rgba(132,204,22,0.8)",
+        })}
+      />
+      <div
+        style={rectStyle(PRINT_RIGHT_RECT, {
+          background: solid ? "rgba(236,72,153,0.16)" : undefined,
+          outline: "1px dashed rgba(236,72,153,0.8)",
+        })}
+      />
+      {/* Print Size outer outline. */}
+      <div style={rectStyle(PRINT_SIZE_RECT, { outline: "2px solid rgba(255,255,255,0.55)" })}>
+        <span className="absolute left-0 top-0 -translate-y-full bg-black/70 px-1 text-[9px] font-medium text-white">
+          Print size
+        </span>
+      </div>
+      {/* Design Area squares — the safe content region. */}
+      <div style={rectStyle(DESIGN_LEFT_RECT, { border: "3px solid #84cc16" })}>
+        <span className="absolute left-1 top-1 bg-[#84cc16] px-1 text-[9px] font-semibold text-black">
+          Design L
+        </span>
+      </div>
+      <div style={rectStyle(DESIGN_RIGHT_RECT, { border: "3px solid #ec4899" })}>
+        <span className="absolute left-1 top-1 bg-[#ec4899] px-1 text-[9px] font-semibold text-white">
+          Design R
+        </span>
+      </div>
+      <CutLines />
+    </div>
+  );
+}
+
+// Dashed CUT lines: they run edge-to-edge across the whole sheet, aligned to the
+// Design-Area (trim) edges, so the press knows exactly where to cut. The final
+// pages are the Design squares; everything outside is bleed that gets trimmed.
+function CutLines() {
+  // Trim edges as % of the Page Area, taken straight from the design rects.
+  const ys = [DESIGN_LEFT_RECT.topPct, DESIGN_LEFT_RECT.topPct + DESIGN_LEFT_RECT.heightPct];
+  const xs = [
+    DESIGN_LEFT_RECT.leftPct,
+    DESIGN_LEFT_RECT.leftPct + DESIGN_LEFT_RECT.widthPct,
+    DESIGN_RIGHT_RECT.leftPct,
+    DESIGN_RIGHT_RECT.leftPct + DESIGN_RIGHT_RECT.widthPct,
+  ];
+  return (
+    <div className="pointer-events-none absolute inset-0 z-[6100]" aria-hidden>
+      {ys.map((y, i) => (
+        <div
+          key={`h${i}`}
+          className="absolute left-0 right-0"
+          style={{
+            top: `${y}%`,
+            height: 0,
+            borderTop: "1px dashed rgba(255,255,255,0.95)",
+            filter: "drop-shadow(0 0 1px rgba(0,0,0,0.9))",
+          }}
+        />
+      ))}
+      {xs.map((x, i) => (
+        <div
+          key={`v${i}`}
+          className="absolute top-0 bottom-0"
+          style={{
+            left: `${x}%`,
+            width: 0,
+            borderLeft: "1px dashed rgba(255,255,255,0.95)",
+            filter: "drop-shadow(0 0 1px rgba(0,0,0,0.9))",
+          }}
+        />
+      ))}
+      <span className="absolute right-1 top-1 rounded bg-black/70 px-1 text-[9px] font-semibold text-white">
+        ✂ Cut lines
+      </span>
+    </div>
+  );
+}
+
+// Positioned layers (image / svg / text) for a page or a side. Container-query
+// units (cqh) make text scale with whatever size the stack is shown at, so the
+// parent must set `containerType: size`.
+function LayerStack({ layers, resolve, aiResultUrl }) {
+  const r = (text) => (resolve ? resolve(text) : text);
+  return layers.map((el) => {
+    const box = {
+      position: "absolute",
+      left: `${el.xPct}%`,
+      top: `${el.yPct}%`,
+      width: `${el.wPct}%`,
+      height: `${el.hPct}%`,
+      zIndex: layerZ(el),
+      transform: el.rotation ? `rotate(${el.rotation}deg)` : undefined,
+    };
+    if (el.type === "image") {
+      const src = aiResultUrl && isAiLayer(el) ? aiResultUrl : el.url;
+      return (
+        <img
+          key={el.id}
+          src={src}
+          alt=""
+          style={box}
+          className={el.fit === "cover" ? "object-cover" : "object-contain"}
+        />
+      );
+    }
+    if (el.type === "svg") {
+      return (
+        <div
+          key={el.id}
+          style={{ ...box, color: el.color }}
+          className={SVG_FILL}
+          dangerouslySetInnerHTML={{ __html: svgMarkup(el) }}
+        />
+      );
+    }
+    return (
+      <div
+        key={el.id}
+        style={{
+          position: "absolute",
+          left: `${el.xPct}%`,
+          top: `${el.yPct}%`,
+          width: `${el.wPct}%`,
+          zIndex: layerZ(el),
+        }}
+      >
+        <div
+          dir="auto"
+          style={elementTextCss(el)}
+          dangerouslySetInnerHTML={{ __html: r(textHtml(el)) || "&nbsp;" }}
+        />
+      </div>
+    );
+  });
+}
+
+// One side of a sheet, composited onto the Page Area:
+//   • background (color / stretched image) fills the PRINT-half rect — this is
+//     the auto-bleed: the background extends past the Design square.
+//   • content (elements) is clipped to the DESIGN square rect.
+function SideLayer({ side, printRect, designRect, resolve, aiResultUrl }) {
+  if (!side) return null;
+  const layers = Array.isArray(side.elements) ? side.elements : [];
+  return (
+    <>
+      <div
+        style={rectStyle(printRect, {
+          background: side.bgColor || undefined,
+          overflow: "hidden",
+          containerType: "size",
+        })}
+      >
+        {side.bgUrl && (
+          <img
+            src={side.bgUrl}
+            alt=""
+            className="absolute inset-0 h-full w-full object-cover"
+            style={
+              side.bgBlur
+                ? { filter: `blur(${side.bgBlur}cqw)`, transform: "scale(1.08)" }
+                : undefined
+            }
+          />
+        )}
+      </div>
+      <div style={rectStyle(designRect, { overflow: "hidden", containerType: "size" })}>
+        <LayerStack layers={layers} resolve={resolve} aiResultUrl={aiResultUrl} />
+      </div>
+    </>
+  );
+}
+
+// Read-only render of a full sheet: the Page Area with both independent sides
+// (left + right) composited at the press's exact geometry.
+function SheetCanvas({ cell, resolve, results, spreadGuide = false, className = "", mirror = false }) {
+  const sides = getSides(cell);
+  // In an RTL (Arabic) book the sheet is mirrored: the RIGHT side (front cover /
+  // odd page) is composited into the LEFT print-half and vice versa. The data
+  // model is unchanged — only the physical placement flips.
+  const leftKey = mirror ? "right" : "left";
+  const rightKey = mirror ? "left" : "right";
+  return (
+    <div
+      className={`relative isolate overflow-hidden bg-white ${className}`}
+      style={{ aspectRatio: PAGE_AREA_RATIO_CSS, containerType: "size" }}
+    >
+      <SideLayer
+        side={sides[leftKey]}
+        printRect={PRINT_LEFT_RECT}
+        designRect={DESIGN_LEFT_RECT}
+        resolve={resolve}
+        aiResultUrl={results?.[`${cell.id}:${leftKey}`]?.url}
+      />
+      <SideLayer
+        side={sides[rightKey]}
+        printRect={PRINT_RIGHT_RECT}
+        designRect={DESIGN_RIGHT_RECT}
+        resolve={resolve}
+        aiResultUrl={results?.[`${cell.id}:${rightKey}`]?.url}
+      />
+      {spreadGuide && <PrintSpecGuides />}
+    </div>
+  );
+}
+
 // Read-only render of a page: background + positioned layers. Container-query
 // units (cqh) make text scale with whatever size the page is shown at.
-function CellCanvas({ cell, ratio, resolve, aiResultUrl, className = "" }) {
+function CellCanvas({ cell, ratio, resolve, aiResultUrl, className = "", spreadGuide = false }) {
   const layers = cellLayers(cell);
   const r = (text) => (resolve ? resolve(text) : text);
   return (
@@ -3426,6 +6203,8 @@ function CellCanvas({ cell, ratio, resolve, aiResultUrl, className = "" }) {
       {cell.bgUrl && (
         <img src={cell.bgUrl} alt="" className="absolute inset-0 z-0 h-full w-full object-cover" />
       )}
+      {/* Print Size + Design Area guides (Page Area is the canvas itself). */}
+      {spreadGuide && <PrintSpecGuides />}
       {layers.map((el) => {
         const box = {
           position: "absolute",
@@ -3489,7 +6268,7 @@ function CellCanvas({ cell, ratio, resolve, aiResultUrl, className = "" }) {
 }
 
 /* ===================== FULL-SCREEN PAGE EDITOR ===================== */
-function CellEditor({ cell, label, aspect, variables, customSymbols = [], onSaveSymbol, onDeleteSymbol, onClose, onSave, onUploadMedia }) {
+function CellEditor({ cell, label, aspect, side = "right", onSwitchSide, variables, characters = [], customSymbols = [], onSaveSymbol, onDeleteSymbol, onClose, onSave, onUploadMedia }) {
   const [elements, setElements] = useState(() =>
     cellLayers(cell).map((el) => ({
       ...el,
@@ -3499,7 +6278,11 @@ function CellEditor({ cell, label, aspect, variables, customSymbols = [], onSave
   );
   const [bgUrl, setBgUrl] = useState(cell.bgUrl || null);
   const [bgFalUrl, setBgFalUrl] = useState(cell.bgFalUrl || null);
-  const [bgColor, setBgColor] = useState(cell.bgColor || "#faf7ef");
+  // Background-image blur, in cqw (% of the print-half width) so it looks the
+  // same in the editor and the book preview regardless of render size.
+  const [bgBlur, setBgBlur] = useState(cell.bgBlur || 0);
+  // null = no background color (transparent). Distinguish it from "unset".
+  const [bgColor, setBgColor] = useState(cell.bgColor === null ? null : cell.bgColor || "#faf7ef");
   // Per-page generation prompt (used only when the page has an AI image).
   const [aiPrompt, setAiPrompt] = useState(cell.aiPrompt || "");
   const [selectedIds, setSelectedIds] = useState([]);
@@ -3508,8 +6291,13 @@ function CellEditor({ cell, label, aspect, variables, customSymbols = [], onSave
   const [editingId, setEditingId] = useState(null);
   const [busy, setBusy] = useState(false);
   const [symbolPicker, setSymbolPicker] = useState(false);
+  const [bgMenuOpen, setBgMenuOpen] = useState(false);
   const [zones, setZones] = useState(() => (Array.isArray(cell.safeZones) ? cell.safeZones : []));
   const [selectedZoneId, setSelectedZoneId] = useState(null);
+  // Kid slots: face regions pinned to cast characters, used for composite-per-face
+  // generation. Each is { id, xPct, yPct, wPct, hPct, characterId, label }.
+  const [kidSlots, setKidSlots] = useState(() => (Array.isArray(cell.kidSlots) ? cell.kidSlots : []));
+  const [selectedSlotId, setSelectedSlotId] = useState(null);
   // The book this page belongs to scopes which fonts are offered: the English
   // tab shows Latin fonts, the Arabic tab shows Arabic fonts.
   const isArabic = (cell.lang || "en") === "ar";
@@ -3524,6 +6312,7 @@ function CellEditor({ cell, label, aspect, variables, customSymbols = [], onSave
   const svgInputRef = useRef(null);
   const fontInputRef = useRef(null);
   const replaceInputRef = useRef(null);
+  const bgImgInputRef = useRef(null);
   // Live contentEditable node + last selection range, for rich-text coloring.
   const editRef = useRef(null);
   const savedRange = useRef(null);
@@ -3533,7 +6322,12 @@ function CellEditor({ cell, label, aspect, variables, customSymbols = [], onSave
   // True while a file is being dragged over the canvas, for the drop highlight.
   const [dropActive, setDropActive] = useState(false);
 
-  const [rw, rh] = ratioNums(aspect);
+  // The editing canvas is one full Print-half so the BLEED is visible while you
+  // design. The Design square is inset inside it; the margin around the square is
+  // the bleed (it gets trimmed off). Background fills the whole half (bleeds);
+  // content lives inside the inset square.
+  const [rw, rh] = PRINT_HALF_RATIO_CSS.split(" / ").map(Number);
+  const designInHalf = side === "left" ? DESIGN_IN_HALF_LEFT : DESIGN_IN_HALF_RIGHT;
 
   useEffect(() => {
     const el = areaRef.current;
@@ -3553,6 +6347,10 @@ function CellEditor({ cell, label, aspect, variables, customSymbols = [], onSave
       const dyPct = ((e.clientY - d.startY) / d.rectH) * 100;
       if (d.target === "zone") {
         setZones((zs) => zs.map((z) => (z.id === d.id ? { ...z, ...dragGeom(z, d, dxPct, dyPct) } : z)));
+        return;
+      }
+      if (d.target === "kidslot") {
+        setKidSlots((ks) => ks.map((k) => (k.id === d.id ? { ...k, ...dragGeom(k, d, dxPct, dyPct) } : k)));
         return;
       }
       // Group move: shift every selected element by the same delta.
@@ -3613,7 +6411,10 @@ function CellEditor({ cell, label, aspect, variables, customSymbols = [], onSave
       if (editingId) return;
       const t = e.target;
       if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.isContentEditable)) return;
-      if (selectedZoneId) {
+      if (selectedSlotId) {
+        e.preventDefault();
+        removeKidSlot(selectedSlotId);
+      } else if (selectedZoneId) {
         e.preventDefault();
         if (!zones.find((z) => z.id === selectedZoneId)?.locked) removeZone(selectedZoneId);
       } else if (selectedIds.length) {
@@ -3624,7 +6425,7 @@ function CellEditor({ cell, label, aspect, variables, customSymbols = [], onSave
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [editingId, selectedZoneId, selectedIds, zones]);
+  }, [editingId, selectedZoneId, selectedSlotId, selectedIds, zones]);
 
   let cw = area.w;
   let ch = (cw * rh) / rw;
@@ -3760,6 +6561,53 @@ function CellEditor({ cell, label, aspect, variables, customSymbols = [], onSave
     dragRef.current = { target: "zone", mode: "resize", corner, id: z.id, startX: e.clientX, startY: e.clientY, ox: z.xPct, oy: z.yPct, ow: z.wPct, oh: z.hPct, rectW: rect.width, rectH: rect.height };
   }
 
+  // Kid slots mirror safe-zone mechanics but bind to a cast character and feed
+  // composite-per-face generation. New slots default to the first unassigned
+  // character (or the first character) so a single-kid story stays trivial.
+  function addKidSlot() {
+    const taken = new Set(kidSlots.map((k) => k.characterId));
+    const free = (characters || []).find((c) => !taken.has(c.id)) || characters?.[0] || null;
+    const k = {
+      id: nid(),
+      xPct: 34,
+      yPct: 22,
+      wPct: 32,
+      hPct: 32,
+      characterId: free?.id || null,
+      label: free?.label || "Kid",
+    };
+    setKidSlots((a) => [...a, k]);
+    setSelectedSlotId(k.id);
+    setSelectedZoneId(null);
+    setSelectedIds([]);
+    setEditingId(null);
+  }
+  function removeKidSlot(id) {
+    setKidSlots((a) => a.filter((k) => k.id !== id));
+    setSelectedSlotId((s) => (s === id ? null : s));
+  }
+  function setKidSlotCharacter(id, characterId) {
+    const ch = (characters || []).find((c) => c.id === characterId) || null;
+    setKidSlots((a) =>
+      a.map((k) => (k.id === id ? { ...k, characterId, label: ch?.label || k.label } : k))
+    );
+  }
+  function startMoveSlot(e, k) {
+    e.stopPropagation();
+    setSelectedSlotId(k.id);
+    setSelectedZoneId(null);
+    setSelectedIds([]);
+    setEditingId(null);
+    const rect = canvasRef.current.getBoundingClientRect();
+    dragRef.current = { target: "kidslot", mode: "move", id: k.id, startX: e.clientX, startY: e.clientY, ox: k.xPct, oy: k.yPct, ow: k.wPct, oh: k.hPct, rectW: rect.width, rectH: rect.height };
+  }
+  function startResizeSlot(e, k, corner) {
+    e.stopPropagation();
+    setSelectedSlotId(k.id);
+    const rect = canvasRef.current.getBoundingClientRect();
+    dragRef.current = { target: "kidslot", mode: "resize", corner, id: k.id, startX: e.clientX, startY: e.clientY, ox: k.xPct, oy: k.yPct, ow: k.wPct, oh: k.hPct, rectW: rect.width, rectH: rect.height };
+  }
+
   const maxZ = () => elements.reduce((m, el) => Math.max(m, el.z || 1), 0);
   const minZ = () => elements.reduce((m, el) => Math.min(m, el.z || 1), 99);
 
@@ -3797,6 +6645,21 @@ function CellEditor({ cell, label, aspect, variables, customSymbols = [], onSave
       }
       setElements((e) => [...e, el]);
       setSelectedIds([el.id]);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  // Set the side BACKGROUND to an uploaded image. The background fills the
+  // whole Print-half (including the bleed past the Design square), so this is
+  // how you make the bleed an image rather than a flat color.
+  async function setBackgroundImageFile(file) {
+    if (!file) return;
+    setBusy(true);
+    try {
+      const { url, falUrl } = await onUploadMedia(file);
+      setBgUrl(url);
+      setBgFalUrl(falUrl || null);
     } finally {
       setBusy(false);
     }
@@ -3906,6 +6769,10 @@ function CellEditor({ cell, label, aspect, variables, customSymbols = [], onSave
     if (!selected || selected.type !== "text") return;
     patchSel({ text: `${selected.text || ""}{{${name}}}`, html: null });
   }
+  function insertToken(token) {
+    if (!selected || selected.type !== "text") return;
+    patchSel({ text: `${selected.text || ""}${token}`, html: null });
+  }
 
   // Remember the caret/selection inside the contentEditable so we can restore
   // it when the color picker steals focus.
@@ -3950,9 +6817,19 @@ function CellEditor({ cell, label, aspect, variables, customSymbols = [], onSave
     patchSel({ color });
   }
 
+  function currentDesign() {
+    return { elements, bgUrl, bgFalUrl, bgColor, bgBlur, safeZones: zones, kidSlots, aiPrompt };
+  }
+
   function save() {
-    onSave(cell.id, { elements, bgUrl, bgFalUrl, bgColor, safeZones: zones, aiPrompt });
+    onSave(cell.id, currentDesign());
     onClose();
+  }
+
+  // Save the current side's work, then switch the editor to the other side.
+  function switchTo(target) {
+    if (!onSwitchSide || target === side) return;
+    onSwitchSide(target, currentDesign());
   }
 
   // Text boxes auto-fit their height to the content, so they only resize
@@ -3973,7 +6850,22 @@ function CellEditor({ cell, label, aspect, variables, customSymbols = [], onSave
       <div className="flex items-center justify-between border-b border-[var(--color-border)] px-4 py-2.5">
         <div className="flex items-center gap-3">
           <span className="text-sm font-semibold">Editing · {label}</span>
-          <span className="text-xs text-zinc-500">{aspect}</span>
+          {/* Side switcher: design the left and right pages independently. */}
+          <div className="flex overflow-hidden rounded-md border border-[var(--color-border)] text-[11px] font-medium">
+            <button
+              onClick={() => switchTo("left")}
+              className={`px-2.5 py-1 ${side === "left" ? "bg-[var(--color-accent)] text-black" : "text-zinc-300 hover:bg-[#242838]"}`}
+            >
+              ◀ Left
+            </button>
+            <button
+              onClick={() => switchTo("right")}
+              className={`px-2.5 py-1 ${side === "right" ? "bg-[var(--color-accent)] text-black" : "text-zinc-300 hover:bg-[#242838]"}`}
+            >
+              Right ▶
+            </button>
+          </div>
+          <span className="text-[11px] text-zinc-500">Dashed line = trim · dark margin = bleed</span>
           <span
             title="Images in the AI group are regenerated with the child; everything else is composited as-is."
             className={`rounded-full px-2 py-0.5 text-[10px] font-medium ${
@@ -4012,30 +6904,133 @@ function CellEditor({ cell, label, aspect, variables, customSymbols = [], onSave
           >
             + Safe zone
           </button>
-          <label
-            title="Page background color"
-            className="flex cursor-pointer items-center gap-2 rounded-md border border-[var(--color-border)] bg-[var(--color-panel-2)] px-3 py-1.5 text-xs font-medium hover:bg-[#242838]"
-          >
-            Background
-            <input
-              type="color"
-              value={bgColor}
-              onChange={(e) => setBgColor(e.target.value)}
-              className="h-5 w-6 cursor-pointer rounded border border-[var(--color-border)] bg-transparent p-0"
-            />
-          </label>
-          {bgUrl && (
+          {characters.length > 1 && (
             <button
-              onClick={() => {
-                setBgUrl(null);
-                setBgFalUrl(null);
-              }}
-              className="rounded-md border border-[var(--color-border)] px-3 py-1.5 text-xs text-zinc-400 hover:bg-rose-600/20 hover:text-rose-200"
-              title="Remove the legacy background image on this page"
+              onClick={addKidSlot}
+              title="Pin a child to a face region for composite generation"
+              className="rounded-md border border-cyan-400/40 bg-cyan-400/10 px-3 py-1.5 text-xs font-medium text-cyan-200 hover:bg-cyan-400/20"
             >
-              Clear BG image
+              + Kid
             </button>
           )}
+          <div className="relative">
+            <button
+              onClick={() => setBgMenuOpen((v) => !v)}
+              title="Set this side's background (color or image). The background bleeds past the design square."
+              className="flex items-center gap-2 rounded-md border border-[var(--color-border)] bg-[var(--color-panel-2)] px-3 py-1.5 text-xs font-medium hover:bg-[#242838]"
+            >
+              Background
+              <span
+                className="h-5 w-7 shrink-0 overflow-hidden rounded border border-[var(--color-border)]"
+                style={
+                  bgUrl
+                    ? undefined
+                    : bgColor
+                    ? { background: bgColor }
+                    : {
+                        backgroundImage:
+                          "linear-gradient(45deg,#555 25%,transparent 25%),linear-gradient(-45deg,#555 25%,transparent 25%),linear-gradient(45deg,transparent 75%,#555 75%),linear-gradient(-45deg,transparent 75%,#555 75%)",
+                        backgroundSize: "8px 8px",
+                        backgroundPosition: "0 0,0 4px,4px -4px,-4px 0",
+                      }
+                }
+              >
+                {bgUrl && <img src={bgUrl} alt="" className="h-full w-full object-cover" />}
+              </span>
+              <span className="text-zinc-500">▾</span>
+            </button>
+            {bgMenuOpen && (
+              <>
+                <div className="fixed inset-0 z-[6500]" onClick={() => setBgMenuOpen(false)} />
+                <div className="absolute left-0 top-full z-[6501] mt-1 w-56 rounded-lg border border-[var(--color-border)] bg-[var(--color-panel)] p-3 shadow-xl">
+                  <div className="mb-1 text-[11px] font-semibold uppercase tracking-wide text-zinc-400">
+                    Color
+                  </div>
+                  <div className="mb-3 flex items-center gap-2">
+                    <input
+                      type="color"
+                      value={bgColor || "#ffffff"}
+                      onChange={(e) => setBgColor(e.target.value)}
+                      className="h-7 w-9 cursor-pointer rounded border border-[var(--color-border)] bg-transparent p-0"
+                    />
+                    <button
+                      onClick={() => setBgColor(null)}
+                      className={`rounded-md border px-2.5 py-1 text-xs ${
+                        bgColor
+                          ? "border-[var(--color-border)] text-zinc-300 hover:bg-rose-600/20 hover:text-rose-200"
+                          : "border-[var(--color-accent)] text-[var(--color-accent)]"
+                      }`}
+                    >
+                      No color
+                    </button>
+                  </div>
+                  <div className="mb-1 text-[11px] font-semibold uppercase tracking-wide text-zinc-400">
+                    Image
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <button
+                      onClick={() => bgImgInputRef.current?.click()}
+                      className="rounded-md border border-[var(--color-border)] bg-[var(--color-panel-2)] px-2.5 py-1 text-xs font-medium hover:bg-[#242838]"
+                    >
+                      {bgUrl ? "Change image" : "Upload image"}
+                    </button>
+                    {bgUrl && (
+                      <button
+                        onClick={() => {
+                          setBgUrl(null);
+                          setBgFalUrl(null);
+                        }}
+                        className="rounded-md border border-[var(--color-border)] px-2.5 py-1 text-xs text-zinc-400 hover:bg-rose-600/20 hover:text-rose-200"
+                      >
+                        Remove
+                      </button>
+                    )}
+                  </div>
+                  {bgUrl && (
+                    <div className="mt-3">
+                      <div className="mb-1 flex items-center justify-between text-[11px] font-semibold uppercase tracking-wide text-zinc-400">
+                        <span>Blur</span>
+                        <span className="font-mono text-zinc-500">{bgBlur.toFixed(1)}</span>
+                      </div>
+                      <div className="flex items-center gap-2">
+                        <input
+                          type="range"
+                          min={0}
+                          max={8}
+                          step={0.25}
+                          value={bgBlur}
+                          onChange={(e) => setBgBlur(Number(e.target.value))}
+                          className="h-1 flex-1 cursor-pointer accent-[var(--color-accent)]"
+                        />
+                        {bgBlur > 0 && (
+                          <button
+                            onClick={() => setBgBlur(0)}
+                            className="rounded-md border border-[var(--color-border)] px-2 py-0.5 text-[11px] text-zinc-400 hover:bg-[#242838]"
+                          >
+                            Reset
+                          </button>
+                        )}
+                      </div>
+                    </div>
+                  )}
+                  <p className="mt-2 text-[10px] leading-snug text-zinc-500">
+                    The background fills the full print area and bleeds past the design square.
+                  </p>
+                </div>
+              </>
+            )}
+          </div>
+          <input
+            ref={bgImgInputRef}
+            type="file"
+            accept="image/*"
+            className="hidden"
+            onChange={(e) => {
+              const f = e.target.files?.[0];
+              if (f) setBackgroundImageFile(f);
+              e.target.value = "";
+            }}
+          />
           <span className="mx-1 h-5 w-px bg-[var(--color-border)]" />
           <button
             onClick={onClose}
@@ -4075,6 +7070,17 @@ function CellEditor({ cell, label, aspect, variables, customSymbols = [], onSave
           }}
           onDeleteZone={removeZone}
           onToggleZoneLock={toggleZoneLock}
+          kidSlots={kidSlots}
+          characters={characters}
+          selectedSlotId={selectedSlotId}
+          onSelectSlot={(id) => {
+            setSelectedSlotId(id);
+            setSelectedZoneId(null);
+            setSelectedIds([]);
+            setEditingId(null);
+          }}
+          onDeleteSlot={removeKidSlot}
+          onSetSlotCharacter={setKidSlotCharacter}
           bgUrl={bgUrl}
           onClearBg={() => {
             setBgUrl(null);
@@ -4086,27 +7092,68 @@ function CellEditor({ cell, label, aspect, variables, customSymbols = [], onSave
         <div ref={areaRef} className="flex min-w-0 flex-1 items-center justify-center overflow-hidden p-6">
           {cw > 0 && (
             <div
-              ref={canvasRef}
-              onPointerDown={() => {
-                setSelectedIds([]);
-                setEditingId(null);
-                setSelectedZoneId(null);
-              }}
-              onDragOver={(e) => {
-                if (!Array.from(e.dataTransfer?.types || []).includes("Files")) return;
-                e.preventDefault();
-                e.dataTransfer.dropEffect = "copy";
-                if (!dropActive) setDropActive(true);
-              }}
-              onDragLeave={(e) => {
-                if (e.currentTarget.contains(e.relatedTarget)) return;
-                setDropActive(false);
-              }}
-              onDrop={handleCanvasDrop}
               className="relative isolate overflow-hidden shadow-2xl shadow-black/50"
-              style={{ width: cw, height: ch, containerType: "size", background: bgColor }}
+              style={{ width: cw, height: ch, background: bgColor, containerType: "size" }}
             >
-              {bgUrl && <img src={bgUrl} alt="" className="absolute inset-0 z-0 h-full w-full object-cover" />}
+              {/* Outer canvas = one full Print-half. The background (color or
+                  image) fills it edge to edge and BLEEDS past the design square.
+                  The dimmed margin around the square is what the press trims off. */}
+              {bgUrl && (
+                <img
+                  src={bgUrl}
+                  alt=""
+                  className="absolute inset-0 z-0 h-full w-full object-cover"
+                  style={
+                    bgBlur
+                      ? { filter: `blur(${bgBlur}cqw)`, transform: "scale(1.08)" }
+                      : undefined
+                  }
+                />
+              )}
+
+              <span className="pointer-events-none absolute left-1 top-1 z-[6000] rounded bg-black/60 px-1.5 py-0.5 text-[9px] font-medium text-amber-200">
+                Bleed · trimmed off
+              </span>
+
+              {/* Inner canvas = the Design square (safe content area), inset at
+                  its real position inside the print-half. Content lives here. */}
+              <div
+                ref={canvasRef}
+                onPointerDown={() => {
+                  setSelectedIds([]);
+                  setEditingId(null);
+                  setSelectedZoneId(null);
+                  setSelectedSlotId(null);
+                }}
+                onDragOver={(e) => {
+                  if (!Array.from(e.dataTransfer?.types || []).includes("Files")) return;
+                  e.preventDefault();
+                  e.dataTransfer.dropEffect = "copy";
+                  if (!dropActive) setDropActive(true);
+                }}
+                onDragLeave={(e) => {
+                  if (e.currentTarget.contains(e.relatedTarget)) return;
+                  setDropActive(false);
+                }}
+                onDrop={handleCanvasDrop}
+                className="absolute"
+                style={{
+                  left: `${designInHalf.leftPct}%`,
+                  top: `${designInHalf.topPct}%`,
+                  width: `${designInHalf.widthPct}%`,
+                  height: `${designInHalf.heightPct}%`,
+                  containerType: "size",
+                }}
+              >
+                {/* Trim line + dimmed bleed: the dashed box is the cut line;
+                    everything outside it (darkened) bleeds and is trimmed. */}
+                <div
+                  className="pointer-events-none absolute inset-0 z-[5500] border border-dashed border-white/70"
+                  style={{ boxShadow: "0 0 0 9999px rgba(0,0,0,0.45)" }}
+                />
+                <span className="pointer-events-none absolute bottom-1 right-1 z-[6000] rounded bg-black/60 px-1.5 py-0.5 text-[9px] font-medium text-white">
+                  Design area · 4962.5²
+                </span>
 
               {dropActive && (
                 <div
@@ -4279,6 +7326,70 @@ function CellEditor({ cell, label, aspect, variables, customSymbols = [], onSave
                   </div>
                 );
               })}
+
+              {/* Kid slots: face regions bound to cast characters. Editor-only
+                  guides that drive composite-per-face generation. */}
+              {kidSlots.map((k) => {
+                const sel = k.id === selectedSlotId;
+                const ch = characters.find((c) => c.id === k.characterId) || null;
+                return (
+                  <div
+                    key={k.id}
+                    style={{
+                      position: "absolute",
+                      left: `${k.xPct}%`,
+                      top: `${k.yPct}%`,
+                      width: `${k.wPct}%`,
+                      height: `${k.hPct}%`,
+                      zIndex: 5001,
+                    }}
+                    className={`pointer-events-none border-2 ${
+                      sel ? "border-cyan-300" : "border-cyan-400/60"
+                    }`}
+                  >
+                    <span
+                      onPointerDown={(e) => startMoveSlot(e, k)}
+                      className="pointer-events-auto absolute left-0 top-0 flex max-w-full -translate-y-full cursor-move items-center gap-1 truncate bg-cyan-400 px-1 text-[9px] font-semibold text-black"
+                    >
+                      {ch?.label || "Unassigned"}
+                    </span>
+                    {characters.length > 1 && (
+                      <select
+                        value={k.characterId || ""}
+                        onPointerDown={(e) => e.stopPropagation()}
+                        onChange={(e) => setKidSlotCharacter(k.id, e.target.value)}
+                        className="pointer-events-auto absolute bottom-0 left-0 max-w-full translate-y-full cursor-pointer rounded-b border border-cyan-400/50 bg-[var(--color-panel)] px-1 py-0.5 text-[9px] text-cyan-100 focus:outline-none"
+                      >
+                        <option value="">Unassigned</option>
+                        {characters.map((c) => (
+                          <option key={c.id} value={c.id}>
+                            {c.label}
+                          </option>
+                        ))}
+                      </select>
+                    )}
+                    <button
+                      onPointerDown={(e) => {
+                        e.stopPropagation();
+                        removeKidSlot(k.id);
+                      }}
+                      title="Remove kid slot"
+                      className="pointer-events-auto absolute right-0 top-0 flex h-4 w-4 items-center justify-center bg-cyan-400 text-[10px] font-bold text-black"
+                    >
+                      ×
+                    </button>
+                    {sel &&
+                      ["nw", "ne", "sw", "se"].map((c) => (
+                        <span
+                          key={c}
+                          onPointerDown={(e) => startResizeSlot(e, k, c)}
+                          className={`pointer-events-auto absolute z-30 h-3 w-3 rounded-sm border border-white bg-cyan-400 ${handlePos[c]}`}
+                        />
+                      ))}
+                  </div>
+                );
+              })}
+              </div>
             </div>
           )}
         </div>
@@ -4517,6 +7628,23 @@ function CellEditor({ cell, label, aspect, variables, customSymbols = [], onSave
                         className="rounded border border-[var(--color-border)] bg-[var(--color-panel-2)] px-1.5 py-0.5 font-mono text-[10px] text-[var(--color-accent)] hover:bg-[#242838]"
                       >
                         {`{{${v.name}}}`}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              )}
+              {characters.length > 1 && (
+                <div>
+                  <PanelLabel>Insert child name</PanelLabel>
+                  <div className="flex flex-wrap gap-1">
+                    {characters.map((c) => (
+                      <button
+                        key={c.id}
+                        onClick={() => insertToken(`{{name:${c.key}}}`)}
+                        title={`${c.label}'s name`}
+                        className="rounded border border-cyan-400/40 bg-cyan-400/10 px-1.5 py-0.5 font-mono text-[10px] text-cyan-200 hover:bg-cyan-400/20"
+                      >
+                        {`{{name:${c.key}}}`}
                       </button>
                     ))}
                   </div>
@@ -4872,7 +8000,7 @@ function LayerRow({ el, isSel, onSelect, onToggleLock, onReorder, onSetPlane, on
   );
 }
 
-function LayersPanel({ elements, selectedIds, onSelect, onToggleLock, onReorder, onSetPlane, onDelete, zones = [], selectedZoneId, onSelectZone, onDeleteZone, onToggleZoneLock, bgUrl, onClearBg }) {
+function LayersPanel({ elements, selectedIds, onSelect, onToggleLock, onReorder, onSetPlane, onDelete, zones = [], selectedZoneId, onSelectZone, onDeleteZone, onToggleZoneLock, kidSlots = [], characters = [], selectedSlotId, onSelectSlot, onDeleteSlot, bgUrl, onClearBg }) {
   // Front-most (highest z) first within each group.
   const byZDesc = (a, b) => (b.z || 1) - (a.z || 1);
   const aiLayers = elements.filter(isAiLayer).sort(byZDesc);
@@ -4971,6 +8099,51 @@ function LayersPanel({ elements, selectedIds, onSelect, onToggleLock, onReorder,
             </div>
           )}
         </div>
+        {characters.length > 1 && (
+          <div>
+            <div className="flex items-center justify-between px-1 pb-1.5">
+              <span className="text-[10px] font-semibold uppercase tracking-wide text-zinc-500">Kids</span>
+              <span className="text-[9px] text-zinc-600">face slots</span>
+            </div>
+            {kidSlots.length === 0 ? (
+              <p className="rounded-md border border-dashed border-[var(--color-border)] px-2 py-2 text-[10px] leading-relaxed text-zinc-600">
+                Pin each child to a face region. Add one with “+ Kid” in the toolbar.
+              </p>
+            ) : (
+              <div className="space-y-1">
+                {kidSlots.map((k, i) => {
+                  const ch = characters.find((c) => c.id === k.characterId) || null;
+                  return (
+                    <div
+                      key={k.id}
+                      onPointerDown={() => onSelectSlot?.(k.id)}
+                      className={`group flex items-center gap-1.5 rounded-md px-2 py-1.5 text-xs ${
+                        k.id === selectedSlotId
+                          ? "bg-cyan-400/15 text-cyan-200"
+                          : "text-zinc-300 hover:bg-[var(--color-panel-2)]"
+                      }`}
+                    >
+                      <span className="flex h-5 w-5 shrink-0 items-center justify-center rounded-sm border border-cyan-400/70 text-[9px] text-cyan-300/80">
+                        {i + 1}
+                      </span>
+                      <span className="min-w-0 flex-1 truncate">{ch?.label || "Unassigned"}</span>
+                      <button
+                        onPointerDown={(e) => {
+                          e.stopPropagation();
+                          onDeleteSlot?.(k.id);
+                        }}
+                        title="Delete kid slot"
+                        className="rounded px-1 text-[11px] text-zinc-500 hover:text-rose-300"
+                      >
+                        ✕
+                      </button>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+        )}
         {bgUrl && (
           <div>
             <div className="px-1 pb-1.5">
@@ -5161,7 +8334,9 @@ function AlignPanel({ count, onAlign, onDelete }) {
 function Cell({
   cell,
   ratio,
-  label,
+  leftLabel,
+  rightLabel,
+  mirror = false,
   variables,
   busy,
   isDragging,
@@ -5178,16 +8353,12 @@ function Cell({
   onDelete,
   onSetCellScoring,
 }) {
-  const fileRef = useRef(null);
-  const bgRef = useRef(null);
-
-  const isText = cell.type === "text";
-  const hasImage = cell.type === "image" && cell.localUrl;
-  const hasElements = Array.isArray(cell.elements) && cell.elements.length > 0;
-  const isEmpty = !isText && !hasImage && !hasElements;
-  const hasBg = !!cell.bgUrl;
-  // A background sits behind text/empty cells (a photo cell is its own content).
-  const showBg = hasBg && !hasImage && !hasElements;
+  const sides = getSides(cell);
+  const sideHasContent = (s) =>
+    (Array.isArray(s.elements) && s.elements.length > 0) ||
+    !!s.bgUrl ||
+    (typeof s.bgColor === "string" && s.bgColor !== DEFAULT_SIDE_BG);
+  const isEmpty = !sideHasContent(sides.left) && !sideHasContent(sides.right);
 
   const frame = `group relative overflow-hidden transition ${
     isDragging ? "opacity-40" : ""
@@ -5200,61 +8371,41 @@ function Cell({
       onDragEnd={onDragEnd}
       onDragOver={onDragOver}
       onDrop={onDrop}
-      className={`${frame} ${isText ? "bg-[var(--color-panel)]" : "bg-white"} cursor-grab active:cursor-grabbing`}
+      className={`${frame} bg-white cursor-grab active:cursor-grabbing`}
     >
-      {/* Free-form page (elements) */}
-      {hasElements && <CellCanvas cell={cell} ratio={ratio} className="w-full" />}
+      {/* Full sheet: both independent sides composited at the print geometry.
+          In an RTL (Arabic) book the sheet is mirrored so the front cover / odd
+          pages sit on the LEFT (front cover | back cover, page 3 | page 2). */}
+      <SheetCanvas cell={cell} className="w-full" spreadGuide mirror={mirror} />
 
-      {/* Background image (behind text/empty legacy content) */}
-      {showBg && (
-        <img src={cell.bgUrl} alt="" className="absolute inset-0 z-0 h-full w-full object-cover" />
-      )}
-
-      {/* Legacy content (cells not yet migrated to elements) */}
-      {!hasElements && hasImage && (
-        <img src={cell.localUrl} alt="" style={{ aspectRatio: ratio }} className="w-full object-contain" />
-      )}
-      {!hasElements && isText && (
-        <div
-          style={{ aspectRatio: ratio }}
-          className="relative z-10 flex w-full items-center justify-center overflow-auto p-4"
-        >
-          <div style={textStyleToCss(cell.style)}>
-            {cell.text ? renderWithVars(cell.text) : <span className="text-zinc-500">Empty text</span>}
-          </div>
-        </div>
-      )}
       {isEmpty && (
-        <div
-          style={{ aspectRatio: ratio }}
-          className={`relative z-10 flex w-full flex-col items-center justify-center gap-2 border border-dashed border-[var(--color-border)] text-zinc-400 ${
-            showBg ? "bg-black/30" : "bg-[var(--color-panel-2)]"
-          }`}
-        >
+        <div className="absolute inset-0 z-[6002] flex flex-col items-center justify-center gap-2 text-zinc-600">
           {busy ? (
             <Spinner />
           ) : (
-            <>
-              <button
-                onClick={() => onOpenEditor(cell.id)}
-                className="rounded-md bg-[var(--color-accent)] px-3 py-1.5 text-xs font-semibold text-black"
-              >
-                Design page
-              </button>
-            </>
+            <button
+              onClick={() => onOpenEditor(cell.id)}
+              className="rounded-md bg-[var(--color-accent)] px-3 py-1.5 text-xs font-semibold text-black"
+            >
+              Design page
+            </button>
           )}
         </div>
       )}
 
       {busy && !isEmpty && (
-        <div className="absolute inset-0 z-20 flex items-center justify-center bg-black/40">
+        <div className="absolute inset-0 z-[6002] flex items-center justify-center bg-black/40">
           <Spinner />
         </div>
       )}
 
-      {/* Label */}
-      <span className="absolute left-1 top-1 z-20 rounded bg-black/60 px-1.5 py-0.5 text-[10px] font-medium text-white">
-        {label}
+      {/* Half labels: the press prints two pages per sheet (left + right). In an
+          RTL book the halves are mirrored, so the labels swap sides too. */}
+      <span className="absolute left-1 top-1 z-[6001] rounded bg-black/60 px-1.5 py-0.5 text-[10px] font-medium text-white">
+        {mirror ? rightLabel : leftLabel}
+      </span>
+      <span className="absolute left-1/2 top-1 z-[6001] ml-1 rounded bg-black/60 px-1.5 py-0.5 text-[10px] font-medium text-white">
+        {mirror ? leftLabel : rightLabel}
       </span>
 
       {/* Identity-scoring level (set by Analyze, manually overridable) */}
@@ -5269,7 +8420,7 @@ function Cell({
               ? `${cell.identityScoringManual ? "Manual · " : ""}${cell.identityNote}`
               : "How this page's identity match is scored per order"
           }
-          className={`absolute bottom-1 left-1 z-20 cursor-pointer rounded px-1.5 py-0.5 text-[10px] font-semibold outline-none ${scoringTagClass(
+          className={`absolute bottom-1 left-1 z-[6002] cursor-pointer rounded px-1.5 py-0.5 text-[10px] font-semibold outline-none ${scoringTagClass(
             cell.identityScoring
           )}`}
         >
@@ -5283,75 +8434,26 @@ function Cell({
       )}
 
       {/* Controls */}
-      <div className="absolute right-1 top-1 z-20 flex gap-1 opacity-0 transition group-hover:opacity-100">
+      <div className="absolute right-1 top-1 z-[6002] flex gap-1 opacity-0 transition group-hover:opacity-100">
         {!isEmpty && (
           <button
             onClick={() => onOpenEditor(cell.id)}
-            title="Open full editor"
-            className="flex h-6 items-center justify-center rounded bg-black/70 px-1.5 text-[12px] font-medium text-white hover:bg-black"
-          >
-            ⛶
-          </button>
-        )}
-        {!hasElements && isText && (
-          <button
-            onClick={() => onOpenEditor(cell.id)}
-            title="Edit in page editor"
-            className="flex h-6 items-center justify-center rounded bg-black/70 px-1.5 text-[10px] font-medium text-white hover:bg-black"
+            title="Edit this page"
+            className="flex h-6 items-center justify-center rounded bg-black/70 px-2 text-[10px] font-medium text-white hover:bg-black"
           >
             Edit
           </button>
         )}
-        {showBg && (
-          <button
-            onClick={() => onRemoveBackground(cell.id)}
-            title="Remove background image"
-            className="flex h-6 items-center justify-center rounded bg-black/70 px-1.5 text-[10px] font-medium text-white hover:bg-rose-600"
-          >
-            BG×
-          </button>
-        )}
-        {!hasElements && hasImage && (
-          <button
-            onClick={() => fileRef.current?.click()}
-            title="Replace photo"
-            className="flex h-6 items-center justify-center rounded bg-black/70 px-1.5 text-[10px] font-medium text-white hover:bg-black"
-          >
-            ⟳
-          </button>
-        )}
         <button
-          onClick={() => onDelete(cell.id)}
-          title="Delete cell"
+          onClick={() => {
+            if (window.confirm("Delete this page? This can't be undone.")) onDelete(cell.id);
+          }}
+          title="Delete page"
           className="flex h-6 w-6 items-center justify-center rounded-full bg-black/70 text-sm text-white hover:bg-rose-600"
         >
           ×
         </button>
       </div>
-
-      <input
-        ref={bgRef}
-        type="file"
-        accept="image/*"
-        hidden
-        onChange={(e) => {
-          const f = e.target.files?.[0];
-          if (f) onUploadBackground(cell.id, f);
-          e.target.value = "";
-        }}
-      />
-
-                  <input
-        ref={fileRef}
-                    type="file"
-                    accept="image/*"
-                    hidden
-        onChange={(e) => {
-          const f = e.target.files?.[0];
-          if (f) onUploadImage(cell.id, f);
-          e.target.value = "";
-        }}
-      />
     </div>
   );
 }
@@ -5448,17 +8550,159 @@ function OrderBook({ cells, results, aspect, variables }) {
 }
 
 /* ============================ ORDER DETAIL ============================ */
+// One child's intake pipeline (upload → restore → anchor). Rendered once per
+// cast character; for single-kid stories there is exactly one of these.
+function KidIntakePanel({ character, showLabel, kid, stage, kidBusy, onUploadKid, regenerateAnchor, onSaveName }) {
+  const inputRef = useRef(null);
+  const busy = stage !== null;
+  const anchorCheck = kid?.identityAnchorCheck || kid?.anchorCheck;
+  const [name, setName] = useState(kid?.name || "");
+  const [nameAr, setNameAr] = useState(kid?.nameAr || "");
+  useEffect(() => {
+    setName(kid?.name || "");
+    setNameAr(kid?.nameAr || "");
+  }, [kid?.name, kid?.nameAr]);
+  const nameDirty = (kid?.name || "") !== name || (kid?.nameAr || "") !== nameAr;
+  return (
+    <div className={showLabel ? "rounded-lg border border-[var(--color-border)] bg-[var(--color-panel-2)] p-3" : ""}>
+      {showLabel && (
+        <div className="mb-2 flex items-center gap-2">
+          <span className="rounded-md bg-cyan-400/15 px-2 py-0.5 text-xs font-semibold text-cyan-200">
+            {character.label}
+          </span>
+          {kid?.photoStatus && kid.photoStatus !== "needs_new_photo" && (
+            <span className="text-[11px] text-emerald-400">✓ photo ready</span>
+          )}
+        </div>
+      )}
+      <div className="flex items-center gap-4">
+        <button
+          onClick={() => inputRef.current?.click()}
+          disabled={busy}
+          className="rounded-lg border border-[var(--color-border)] bg-[var(--color-panel-2)] px-4 py-2 text-sm font-medium hover:bg-[#242838] disabled:opacity-40"
+        >
+          {kid ? "Change photo" : "Upload photo"}
+        </button>
+        <input
+          ref={inputRef}
+          type="file"
+          accept="image/*"
+          hidden
+          onChange={(e) => {
+            onUploadKid(e);
+            if (inputRef.current) inputRef.current.value = "";
+          }}
+        />
+        {busy && (
+          <span className="text-sm text-[var(--color-accent)]">
+            {stage === "uploading"
+              ? "Uploading…"
+              : stage === "restoring"
+              ? "Step 2 of 3 · Restoring photo…"
+              : "Step 3 of 3 · Painting character anchor…"}
+          </span>
+        )}
+      </div>
+
+      {(kid || busy) && (
+        <>
+          <div className="mt-4 grid grid-cols-3 gap-4">
+            <Stage label="1 · Original" url={kid?.localUrl} loading={stage === "uploading"} loadingLabel="Uploading…" />
+            <Stage
+              label="2 · Restored"
+              url={kid?.restoreOutcome === "used" ? kid?.restoredLocal : kid?.restoreOutcome ? kid?.localUrl : kid?.restoredLocal}
+              loading={stage === "restoring"}
+              loadingLabel="Restoring…"
+              caption={restoreOutcomeLabel(kid?.restoreOutcome)}
+            />
+            <Stage
+              label="3 · Portrait"
+              url={kid?.presentationLocal || kid?.anchorLocal}
+              highlight
+              loading={stage === "anchoring"}
+              loadingLabel="Painting anchor…"
+            />
+          </div>
+          {kid?.photoStatus && (
+            <div className="mt-3">
+              <PhotoCheckPanel kid={kid} />
+            </div>
+          )}
+          <div className="mt-3 flex flex-wrap items-center gap-3">
+            <button
+              onClick={regenerateAnchor}
+              disabled={busy || !kid}
+              className="rounded-lg border border-[var(--color-border)] bg-[var(--color-panel-2)] px-3 py-1.5 text-xs font-medium hover:bg-[#242838] disabled:opacity-40"
+            >
+              ↻ Regenerate anchor
+            </button>
+            {!busy && anchorCheck && (
+              <span className="flex items-center gap-2">
+                <span className="text-xs text-zinc-500">Anchor identity:</span>
+                <ScoreBadge check={anchorCheck} size="lg" />
+              </span>
+            )}
+            {!busy && kid?.identityAnchorWeak && (
+              <span className="rounded-md border border-amber-500/40 bg-amber-500/10 px-2 py-0.5 text-[11px] text-amber-300">
+                ⚠ Weak anchor — using the photo for likeness
+              </span>
+            )}
+            {!busy && kid?.featuresStruct && <FeatureBadges features={kid.featuresStruct} />}
+          </div>
+          {!busy && anchorCheck?.score != null && anchorCheck.score < 70 && (
+            <div className="mt-2 rounded-lg border border-amber-400/30 bg-amber-400/5 p-2.5 text-xs text-amber-200">
+              Weak match — regenerate the anchor before generating pages.
+              <Mismatches check={anchorCheck} />
+            </div>
+          )}
+          {onSaveName && (
+            <div className="mt-3 flex flex-wrap items-end gap-2">
+              <label className="flex flex-col gap-1 text-[11px] text-zinc-500">
+                Name
+                <input
+                  value={name}
+                  onChange={(e) => setName(e.target.value)}
+                  placeholder="e.g. Sara"
+                  className="w-40 rounded-md border border-[var(--color-border)] bg-[var(--color-panel)] px-3 py-1.5 text-sm focus:border-[var(--color-accent)] focus:outline-none"
+                />
+              </label>
+              <label className="flex flex-col gap-1 text-[11px] text-zinc-500">
+                Arabic name
+                <input
+                  value={nameAr}
+                  onChange={(e) => setNameAr(e.target.value)}
+                  dir="rtl"
+                  placeholder="مثال: سارة"
+                  className="w-40 rounded-md border border-[var(--color-border)] bg-[var(--color-panel)] px-3 py-1.5 text-sm focus:border-[var(--color-accent)] focus:outline-none"
+                />
+              </label>
+              <button
+                onClick={() => onSaveName({ name, nameAr })}
+                disabled={!nameDirty}
+                className="rounded-md bg-[var(--color-accent)] px-3 py-1.5 text-xs font-semibold text-black disabled:cursor-not-allowed disabled:opacity-40"
+              >
+                Save name
+              </button>
+              <span className="font-mono text-[10px] text-zinc-600">{`{{name:${character.key}}}`}</span>
+            </div>
+          )}
+        </>
+      )}
+    </div>
+  );
+}
+
 function OrderDetail({
   order,
   kid,
   results,
   onBack,
   onDelete,
-  kidInput,
   onUploadKid,
-  stage,
+  kidStages,
   kidBusy,
   regenerateAnchor,
+  onSaveName,
   mode,
   setMode,
   prompt,
@@ -5470,8 +8714,21 @@ function OrderDetail({
   generatingAll,
   busy,
   config,
+  countries,
 }) {
   const [showPreview, setShowPreview] = useState(true);
+  const p = order.pricing;
+  // The cast for this order's story (one character for single-kid stories).
+  const characters = order.characters?.length ? order.characters : [{ id: "child", label: "Child" }];
+  const primaryId = characters[0].id;
+  const kidOf = (cid) => order.kids?.[cid] || (cid === primaryId ? kid : null) || null;
+  // Every cast member must have an accepted photo before pages can generate.
+  const allKidsReady = characters.every((c) => {
+    const k = kidOf(c.id);
+    return k && k.photoStatus !== "needs_new_photo";
+  });
+  // Per-character names for the page preview ({{name:<key>}} resolution).
+  const orderNames = orderNameMap(order);
   return (
     <>
       <BackButton onClick={onBack} />
@@ -5499,7 +8756,34 @@ function OrderDetail({
             {" · "}
             {order.gender === "male" ? "Boy" : order.gender === "non-binary" ? "Child" : "Girl"}
             {order.age ? `, age ${order.age}` : ""}
+            {" · "}
+            {isoToFlag(order.country)} {countryName(order.country)}
+            {order.customer && (
+              <>
+                {" · "}
+                {order.customer.name}{" "}
+                <span className="font-mono text-xs text-zinc-500">{order.customer.phone}</span>
+              </>
+            )}
           </p>
+          {p && (
+            <p className="mt-1 text-sm">
+              <span className="font-semibold text-zinc-100">{formatMoney(p.total, p.currency)}</span>
+              {p.discountPrice != null && p.listPrice != null && (
+                <span className="ml-2 text-zinc-500 line-through">
+                  {formatMoney(p.listPrice, p.currency)}
+                </span>
+              )}
+              {p.taxEnabled && (
+                <span className="text-zinc-500">
+                  {"  ("}
+                  {formatMoney(p.base, p.currency)} + {p.taxLabel} {p.taxRate}%
+                  {p.taxInclusive ? ", incl." : ""}
+                  {")"}
+                </span>
+              )}
+            </p>
+          )}
         </div>
         <button
           onClick={onDelete}
@@ -5515,91 +8799,31 @@ function OrderDetail({
         </div>
       )}
 
-      {/* Step 1 - kid */}
-      <Section step="1" title="Upload the kid's photo (auto restore + anchor)">
-        <div className="flex items-center gap-4">
-          <button
-            onClick={() => kidInput.current?.click()}
-            disabled={kidBusy}
-            className="rounded-lg border border-[var(--color-border)] bg-[var(--color-panel-2)] px-4 py-2 text-sm font-medium hover:bg-[#242838] disabled:opacity-40"
-          >
-            {kid ? "Change photo" : "Upload photo"}
-          </button>
-          <input ref={kidInput} type="file" accept="image/*" hidden onChange={onUploadKid} />
-                  {kidBusy && (
-                    <span className="text-sm text-[var(--color-accent)]">
-                      {stage === "uploading"
-                        ? "Uploading…"
-                        : stage === "restoring"
-                        ? "Step 2 of 3 · Restoring photo…"
-                        : "Step 3 of 3 · Painting character anchor…"}
-                    </span>
-                  )}
-                </div>
-
-                {(kid || kidBusy) && (
-                  <>
-                    <div className="mt-4 grid grid-cols-3 gap-4">
-                      <Stage
-                        label="1 · Original"
-                        url={kid?.localUrl}
-                        loading={stage === "uploading"}
-                        loadingLabel="Uploading…"
-                      />
-                      <Stage
-                        label="2 · Restored"
-                        url={kid?.restoreOutcome === "used" ? kid?.restoredLocal : kid?.restoreOutcome ? kid?.localUrl : kid?.restoredLocal}
-                        loading={stage === "restoring"}
-                        loadingLabel="Restoring…"
-                        caption={restoreOutcomeLabel(kid?.restoreOutcome)}
-                      />
-                      <Stage
-                        label="3 · Portrait"
-                        url={kid?.presentationLocal || kid?.anchorLocal}
-                        highlight
-                        loading={stage === "anchoring"}
-                        loadingLabel="Painting anchor…"
-                      />
-                    </div>
-                    {kid?.photoStatus && (
-                      <div className="mt-3">
-                        <PhotoCheckPanel kid={kid} />
-                      </div>
-                    )}
-                    <div className="mt-3 flex flex-wrap items-center gap-3">
-                      <button
-                        onClick={regenerateAnchor}
-                disabled={kidBusy || !kid}
-                        className="rounded-lg border border-[var(--color-border)] bg-[var(--color-panel-2)] px-3 py-1.5 text-xs font-medium hover:bg-[#242838] disabled:opacity-40"
-                      >
-                        ↻ Regenerate anchor
-                      </button>
-                      {!kidBusy && (kid?.identityAnchorCheck || kid?.anchorCheck) && (
-                        <span className="flex items-center gap-2">
-                          <span className="text-xs text-zinc-500">Anchor identity:</span>
-                          <ScoreBadge check={kid.identityAnchorCheck || kid.anchorCheck} size="lg" />
-                        </span>
-                      )}
-                      {!kidBusy && kid?.identityAnchorWeak && (
-                        <span className="rounded-md border border-amber-500/40 bg-amber-500/10 px-2 py-0.5 text-[11px] text-amber-300">
-                          ⚠ Weak anchor — using the photo for likeness
-                        </span>
-                      )}
-                      {!kidBusy && kid?.featuresStruct && (
-                        <FeatureBadges features={kid.featuresStruct} />
-                      )}
-                    </div>
-                    {!kidBusy &&
-                      (kid?.identityAnchorCheck || kid?.anchorCheck)?.score != null &&
-                      (kid?.identityAnchorCheck || kid?.anchorCheck).score < 70 && (
-                        <div className="mt-2 rounded-lg border border-amber-400/30 bg-amber-400/5 p-2.5 text-xs text-amber-200">
-                          Weak match — regenerate the anchor before generating pages.
-                          <Mismatches check={kid.identityAnchorCheck || kid.anchorCheck} />
-                        </div>
-                      )}
-                  </>
-                )}
-              </Section>
+      {/* Step 1 - kid photos (one panel per cast character) */}
+      <Section
+        step="1"
+        title={
+          characters.length > 1
+            ? "Upload each child's photo (auto restore + anchor)"
+            : "Upload the kid's photo (auto restore + anchor)"
+        }
+      >
+        <div className="space-y-5">
+          {characters.map((c) => (
+            <KidIntakePanel
+              key={c.id}
+              character={c}
+              showLabel={characters.length > 1}
+              kid={kidOf(c.id)}
+              stage={kidStages?.[c.id] || null}
+              kidBusy={kidBusy}
+              onUploadKid={(e) => onUploadKid(e, c.id)}
+              regenerateAnchor={() => regenerateAnchor(c.id)}
+              onSaveName={characters.length > 1 ? (payload) => onSaveName(c.id, payload) : null}
+            />
+          ))}
+        </div>
+      </Section>
 
       {/* Step 2 - generate */}
       <Section step="2" title="Generate scenes with this kid">
@@ -5631,7 +8855,7 @@ function OrderDetail({
 
                 <button
                   onClick={generateAll}
-          disabled={!kid || kidBusy || generatingAll || order.scenes.length === 0}
+          disabled={!allKidsReady || kidBusy || generatingAll || order.scenes.length === 0}
                   className="rounded-lg bg-[var(--color-accent)] px-5 py-2.5 text-sm font-semibold text-black disabled:cursor-not-allowed disabled:opacity-40"
                 >
                   {generatingAll ? "Generating…" : "Generate all scenes"}
@@ -5680,7 +8904,8 @@ function OrderDetail({
                   busy={busy[scene.id]}
                   aspect={order.aspect}
                   variables={order.variables}
-                  canGenerate={Boolean(kid)}
+                  names={orderNames}
+                  canGenerate={allKidsReady}
                   onRegenerate={() => generateOne(scene.id)}
                 />
               ))}
@@ -5807,12 +9032,12 @@ function textChanges(scene, variables) {
 //  • Original = the page as designed (template AI image, variable tokens shown).
 //  • Updated  = the AI-plane image regenerated with the child + variables filled.
 // Pages with no AI image and no variable changes render once, labeled "Static".
-function OrderPageRow({ scene, label, result, busy, aspect, variables, canGenerate, onRegenerate }) {
+function OrderPageRow({ scene, label, result, busy, aspect, variables, names, canGenerate, onRegenerate }) {
   const ratio = (aspect || "3:4").replace(":", " / ");
   const hasAi = sceneHasAiBase(scene);
   const changes = hasAi || textChanges(scene, variables);
   const identity = (t) => t;
-  const resolved = (t) => applyVarsClient(t, variables || {});
+  const resolved = (t) => applyVarsClient(t, variables || {}, names);
 
   const renderPage = ({ resolve, aiResultUrl }) => {
     const hasElements = Array.isArray(scene.elements) && scene.elements.length > 0;
